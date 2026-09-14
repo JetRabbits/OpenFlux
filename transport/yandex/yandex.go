@@ -134,12 +134,14 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		headers.Set("Cookie", info.CookieStr)
 		headers.Set("Host", info.Host)
 
+		utils.Debugf("[YDOCS] Dialing WebSocket: %s", info.WsURL)
 		conn, _, err := dialer.Dial(info.WsURL, headers)
 		if err != nil {
 			utils.Debugf("[YDOCS] WebSocket dial failed: %v", err)
 			t.scheduleReconnect(attempt)
 			return
 		}
+		utils.Debugf("[YDOCS] WebSocket connected")
 
 		writeQueue := make(chan []byte, t.GetConfig().MaxQueueSize)
 		if existingSession != nil {
@@ -298,8 +300,12 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int) {
 	t.RecordReconnect()
 	delay := time.Duration(float64(t.GetConfig().ReconnectDelay) *
 		math.Pow(t.GetConfig().ReconnectMultiplier, float64(attempt)))
+	if delay <= 0 {
+		delay = time.Second
+	}
 
-        fmt.Println("[YDOCS] Reconnecting in %v...", delay)
+	utils.Debugf("[YDOCS] Reconnecting in %v...", delay)
+	time.Sleep(delay)
 	t.connectToDoc(attempt + 1)
 }
 
@@ -309,16 +315,19 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		Timeout:       30 * time.Second,
 	}
 
-	req, _ := http.NewRequest("GET", url, nil)
+		req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
+	utils.Debugf("[YDOCS] Fetching document URL: %s", url)
 	resp, err := client.Do(req)
 	if err != nil {
 		return YandexDocsInfo{}, err
 	}
 	defer resp.Body.Close()
+	utils.Debugf("[YDOCS] Document response: status=%d final_url=%s", resp.StatusCode, resp.Request.URL.String())
 
 	htmlBytes, _ := io.ReadAll(resp.Body)
 	html := string(htmlBytes)
+	utils.Debugf("[YDOCS] Document HTML read: bytes=%d", len(htmlBytes))
 
 	var cookies []string
 	for _, c := range resp.Cookies() {
@@ -330,43 +339,100 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	if len(matches) < 2 {
 		return YandexDocsInfo{}, fmt.Errorf("config not found")
 	}
+	utils.Debugf("[YDOCS] client-config found")
 
 	var config map[string]interface{}
-	json.Unmarshal([]byte(matches[1]), &config)
-	officeAction := config["officeActionData"].(map[string]interface{})
+	if err := json.Unmarshal([]byte(matches[1]), &config); err != nil {
+		return YandexDocsInfo{}, fmt.Errorf("client-config JSON parse failed: %w", err)
+	}
+	officeAction, ok := config["officeActionData"].(map[string]interface{})
+	if !ok || officeAction == nil {
+		return YandexDocsInfo{}, fmt.Errorf("officeActionData not found in client-config")
+	}
 
 	editorConfigRaw, ok := officeAction["editor_config"].(map[string]interface{})
 	if !ok || editorConfigRaw == nil {
 		return YandexDocsInfo{}, fmt.Errorf("editor_config nil - will reconnect")
 	}
 
-	balancerURL := officeAction["balancer_url"].(string)
+	balancerURL, ok := stringValue(officeAction, "balancer_url")
+	if !ok || balancerURL == "" {
+		return YandexDocsInfo{}, t.unsupportedVolgaError(officeAction, editorConfigRaw)
+	}
 	host := strings.TrimPrefix(balancerURL, "https://")
-	document := editorConfigRaw["document"].(map[string]interface{})
+	utils.Debugf("[YDOCS] legacy schema detected: host=%s", host)
+	document, ok := editorConfigRaw["document"].(map[string]interface{})
+	if !ok || document == nil {
+		return YandexDocsInfo{}, t.unsupportedVolgaError(officeAction, editorConfigRaw)
+	}
+	token, ok := stringValue(editorConfigRaw, "token")
+	if !ok || token == "" {
+		return YandexDocsInfo{}, t.unsupportedVolgaError(officeAction, editorConfigRaw)
+	}
+	docID, ok := stringValue(document, "key")
+	if !ok || docID == "" {
+		return YandexDocsInfo{}, fmt.Errorf("document.key not found in editor_config")
+	}
 
 	perms, _ := document["permissions"].(map[string]interface{})
 	if perms == nil {
 		perms = make(map[string]interface{})
 	}
+	fileType, _ := stringValue(document, "fileType")
+	docURL, _ := stringValue(document, "url")
+	title, _ := stringValue(document, "title")
 
 	return YandexDocsInfo{
 		CookieStr:   strings.Join(cookies, "; "),
-		Token:       editorConfigRaw["token"].(string),
-		DocID:       document["key"].(string),
+		Token:       token,
+		DocID:       docID,
 		Origin:      balancerURL,
 		Host:        host,
-		WsURL:       fmt.Sprintf("wss://%s/2024.1.1-375/doc/%s/c/?EIO=4&transport=websocket", host, document["key"].(string)),
+		WsURL:       fmt.Sprintf("wss://%s/2024.1.1-375/doc/%s/c/?EIO=4&transport=websocket", host, docID),
 		Permissions: perms,
 		OpenCmd: map[string]interface{}{
 			"c":      "open",
-			"id":     document["key"].(string),
+			"id":     docID,
 			"userid": userID,
-			"format": document["fileType"],
-			"url":    document["url"],
-			"title":  document["title"],
+			"format": fileType,
+			"url":    docURL,
+			"title":  title,
 			"lcid":   25,
 		},
 	}, nil
+}
+
+func stringValue(m map[string]interface{}, key string) (string, bool) {
+	v, ok := m[key]
+	if !ok || v == nil {
+		return "", false
+	}
+	s, ok := v.(string)
+	return s, ok
+}
+
+func (t *YandexDocsTransport) unsupportedVolgaError(officeAction map[string]interface{}, editorConfig map[string]interface{}) error {
+	if actionURL, ok := stringValue(officeAction, "action_url"); ok && actionURL != "" {
+		resourceURL, _ := stringValue(officeAction, "resource_url")
+		return fmt.Errorf(
+			"unsupported Yandex Volga/WOPI document schema: missing legacy balancer_url/editor_config.token/document.key; action_url=%s resource_url=%s",
+			actionURL,
+			resourceURL,
+		)
+	}
+	return fmt.Errorf(
+		"unsupported Yandex document schema: missing legacy balancer_url/editor_config.token/document.key; editor_config_keys=%v office_action_keys=%v",
+		mapKeys(editorConfig),
+		mapKeys(officeAction),
+	)
+}
+
+func mapKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func randUserID() string {

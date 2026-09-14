@@ -5,7 +5,10 @@ OUTPUT_DIR="output/ios"
 LIBRARY_NAME="liboflux"
 
 # Paths configuration
-XCODE_PATH="/path/to/Xcode.app"
+XCODE_PATH="${XCODE_PATH:-$(xcode-select -p 2>/dev/null | sed 's#/Contents/Developer##')}"
+if [ -z "$XCODE_PATH" ] || [ ! -d "$XCODE_PATH" ]; then
+    XCODE_PATH="/Applications/Xcode.app"
+fi
 DEVELOPER_DIR="$XCODE_PATH/Contents/Developer"
 SDK_PATH="$DEVELOPER_DIR/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk"
 CLANG="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
@@ -43,28 +46,10 @@ if go build \
     -o "$OUTPUT_DIR/$LIBRARY_NAME.a" \
     . ; then
     
-    # Create header if not auto-generated
-    if [ ! -f "$OUTPUT_DIR/$LIBRARY_NAME.h" ]; then
-        cat > "$OUTPUT_DIR/$LIBRARY_NAME.h" << 'HEADEREOF'
-#ifndef LIBTUNNEL_H
-#define LIBTUNNEL_H
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-void RunMain(void);
-void RunMainClient(char* url);
-void RunMainExitNode(void);
-
-#ifdef __cplusplus
-}
-#endif
-
-#endif /* LIBTUNNEL_H */
-HEADEREOF
-    fi
-    
+    # go build -buildmode=c-archive auto-generates $OUTPUT_DIR/$LIBRARY_NAME.h
+    # next to the .a from the //export comments in bind_mobile.go — no manual
+    # header stub needed (a previous placeholder here referenced a stale
+    # RunMain/RunMainClient/RunMainExitNode API that no longer exists).
     echo "Build complete: $OUTPUT_DIR/$LIBRARY_NAME.a"
     ls -lh "$OUTPUT_DIR/$LIBRARY_NAME.a"
     

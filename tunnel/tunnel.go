@@ -40,14 +40,14 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
 	})
 
-        if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber,
-            &tcpip.TCPReceiveBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576}); err != nil {
-            utils.Debugf("[TUNNEL] Failed to set recv buffer: %v", err)
-        }
-        if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber,
-            &tcpip.TCPSendBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576}); err != nil {
-            utils.Debugf("[TUNNEL] Failed to set send buffer: %v", err)
-        }
+	if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber,
+		&tcpip.TCPReceiveBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576}); err != nil {
+		utils.Debugf("[TUNNEL] Failed to set recv buffer: %v", err)
+	}
+	if err := t.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber,
+		&tcpip.TCPSendBufferSizeRangeOption{Min: 65536, Default: 262144, Max: 1048576}); err != nil {
+		utils.Debugf("[TUNNEL] Failed to set send buffer: %v", err)
+	}
 
 	tunnelEP := NewTunnelLinkEndpoint()
 	tunnelEP.onOutgoingPacket = func(data []byte) {
@@ -168,6 +168,20 @@ func (t *TCPTunnel) ListenTCP(port uint16) (net.Listener, error) {
 		NIC:  1,
 		Port: port,
 	}, ipv4.ProtocolNumber)
+}
+
+// SetMTU aligns this tunnel's internal netstack MTU (used when framing
+// packets handed to the transport's Send()) with the real MTU the Android
+// TUN interface / SOCKS path was configured with. Without this, the carrier
+// side always framed packets at a hardcoded 1500 bytes regardless of what
+// MTU the rest of the pipeline actually used, which is not necessarily what
+// the SOCKS-relayed path can efficiently sustain end-to-end. Affects TCP MSS
+// negotiated for connections established after this call; already-open
+// connections keep their existing MSS.
+func (t *TCPTunnel) SetMTU(mtu uint32) {
+	if t.tunnelEP != nil {
+		t.tunnelEP.SetMTU(mtu)
+	}
 }
 
 func (t *TCPTunnel) printStats() {
