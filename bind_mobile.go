@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -214,6 +215,24 @@ func (d *fluxPacketFlowDevice) Name() string { return "fluxpacketflow" }
 func (d *fluxPacketFlowDevice) Type() string { return "fluxpacketflow" }
 
 func fluxTun2SocksStackOptions() []t2option.Option {
+	if runtime.GOOS == "ios" {
+		// iOS NetworkExtension (PacketTunnelProvider) processes are killed
+		// around a 50 MB phys_footprint. gVisor/tun2socks defaults let each TCP
+		// endpoint allocate ~1 MB send and up to ~4 MB receive buffer with
+		// auto-tuning enabled — fine on Android/desktop, but on iOS enough
+		// concurrent flows (e.g. a SpeedTest) can consume the whole jetsam
+		// budget. Mirror libgalactic_tun.so's own proven-safe iOS profile:
+		// disable receive-buffer auto-tuning and cap both directions to a
+		// deliberately small, fixed range so TCP applies backpressure instead
+		// of the extension getting killed for crossing the hard memory limit.
+		return []t2option.Option{
+			t2option.WithTCPModerateReceiveBuffer(false),
+			t2option.WithTCPSendBufferSizeRange(4<<10, 64<<10, 128<<10),
+			t2option.WithTCPReceiveBufferSizeRange(4<<10, 64<<10, 128<<10),
+		}
+	}
+	// Non-iOS (Android/desktop): no comparably strict memory ceiling, so allow
+	// gVisor's own generous default buffer sizes with receive-side auto-tuning.
 	return []t2option.Option{
 		t2option.WithTCPModerateReceiveBuffer(true),
 	}
