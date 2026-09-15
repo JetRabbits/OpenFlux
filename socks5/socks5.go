@@ -26,9 +26,17 @@ type Dialer interface {
 // footprint growth per 5 s burst, with FreeOSMemory unable to reclaim any
 // of it because the goroutines were still live).
 const (
-	DefaultMaxTCPFlows        = 12
-	DefaultMaxUDPFlows        = 8
-	DefaultMaxTotalFlows      = 20
+	// Tuned against real iOS NetworkExtension behaviour: the tunnel-owner
+	// device allocates one UDP ASSOCIATE per destination (every DNS
+	// resolver, NTP, captive portal probes...), so the startup burst alone
+	// negotiates 10-15 associates. The Cordyceps-baseline 8 starved DNS
+	// with "connection not allowed by ruleset" retry storms on first
+	// device tests. Idle/terminal reaping keeps the real steady state tiny
+	// (observed 0-3 DNS associates); the caps are emergency brakes, with
+	// worst-case cost ~48 * (32 KB copy + 128 KB gvisor buffer) ~ 8 MB.
+	DefaultMaxTCPFlows        = 24
+	DefaultMaxUDPFlows        = 32
+	DefaultMaxTotalFlows      = 48
 	DefaultHandshakeTimeout   = 10 * time.Second
 	DefaultSessionIdleTimeout = 75 * time.Second
 	DefaultUDPEndpointTimeout = 45 * time.Second
