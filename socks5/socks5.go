@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"universal-bypass-tool/utils"
@@ -17,17 +18,91 @@ type Dialer interface {
 	DialTCP(address string) (net.Conn, error)
 }
 
+// Resource ceilings for in-process SOCKS sessions, mirroring the hardening
+// that made the Cordyceps mobile runtime survive iOS NetworkExtension
+// jetsam limits (~50 MB phys_footprint): an uncapped, undeadlined session
+// table lets every half-dead tun2socks tunnel retain two blocked io.Copy
+// goroutines plus buffers forever (observed stackInuse 7.5 MB and ~7 MB/
+// footprint growth per 5 s burst, with FreeOSMemory unable to reclaim any
+// of it because the goroutines were still live).
+const (
+	DefaultMaxTCPFlows        = 12
+	DefaultMaxUDPFlows        = 8
+	DefaultMaxTotalFlows      = 20
+	DefaultHandshakeTimeout   = 10 * time.Second
+	DefaultSessionIdleTimeout = 75 * time.Second
+	DefaultUDPEndpointTimeout = 45 * time.Second
+)
+
+type flowLimits struct {
+	maxTCP      int
+	maxUDP      int
+	maxTotal    int
+	handshake   time.Duration
+	idle        time.Duration
+	udpEndpoint time.Duration
+}
+
 type SOCKS5Server struct {
 	listenAddr string
 	dialer     Dialer
+	limits     flowLimits
 
 	mu       sync.Mutex
 	listener net.Listener
 	closed   bool
+
+	activeTCP atomic.Int32
+	activeUDP atomic.Int32
 }
 
 func NewSOCKS5Server(addr string, dialer Dialer) *SOCKS5Server {
-	return &SOCKS5Server{listenAddr: addr, dialer: dialer}
+	return &SOCKS5Server{
+		listenAddr: addr,
+		dialer:     dialer,
+		limits: flowLimits{
+			maxTCP:      DefaultMaxTCPFlows,
+			maxUDP:      DefaultMaxUDPFlows,
+			maxTotal:    DefaultMaxTotalFlows,
+			handshake:   DefaultHandshakeTimeout,
+			idle:        DefaultSessionIdleTimeout,
+			udpEndpoint: DefaultUDPEndpointTimeout,
+		},
+	}
+}
+
+// SetFlowLimits overrides the resource ceilings for tests and platform
+// bindings. Any zero/negative argument keeps the current value for that
+// field. Call before Start/StartInBackground.
+func (s *SOCKS5Server) SetFlowLimits(maxTCP, maxUDP, maxTotal int, handshake, idle, udpEndpoint time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if maxTCP > 0 {
+		s.limits.maxTCP = maxTCP
+	}
+	if maxUDP > 0 {
+		s.limits.maxUDP = maxUDP
+	}
+	if maxTotal > 0 {
+		s.limits.maxTotal = maxTotal
+	}
+	if handshake > 0 {
+		s.limits.handshake = handshake
+	}
+	if idle > 0 {
+		s.limits.idle = idle
+	}
+	if udpEndpoint > 0 {
+		s.limits.udpEndpoint = udpEndpoint
+	}
+}
+
+// ActiveTCPFlows / ActiveUDPFlows / ActiveTotalFlows expose the live session
+// counts for runtime diagnostics (same role as the Cordyceps SOCKS counters).
+func (s *SOCKS5Server) ActiveTCPFlows() int { return int(s.activeTCP.Load()) }
+func (s *SOCKS5Server) ActiveUDPFlows() int { return int(s.activeUDP.Load()) }
+func (s *SOCKS5Server) ActiveTotalFlows() int {
+	return int(s.activeTCP.Load()) + int(s.activeUDP.Load())
 }
 
 func (s *SOCKS5Server) Start() error {
@@ -115,6 +190,17 @@ func (s *SOCKS5Server) Close() error {
 func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
+	handshake, idle, udpEndpoint := func() (time.Duration, time.Duration, time.Duration) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.limits.handshake, s.limits.idle, s.limits.udpEndpoint
+	}()
+
+	// Handshake phase must not be able to pin a goroutine forever: a
+	// half-open gvisor tunnel that never sends its greeting would otherwise
+	// leak a session slot and its stacks indefinitely.
+	_ = clientConn.SetReadDeadline(time.Now().Add(handshake))
+
 	buf := make([]byte, 256)
 	n, err := clientConn.Read(buf)
 	if err != nil || n < 2 || buf[0] != 0x05 {
@@ -128,8 +214,17 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 		return
 	}
 
+	// Handshake complete; deadlines from here on are per-transfer.
+	_ = clientConn.SetReadDeadline(time.Time{})
+
 	if buf[1] == 0x03 {
-		s.handleUDPAssociate(clientConn)
+		if !s.reserveFlow(true) {
+			utils.Debugf("[SOCKS5] UDP flow cap reached, rejecting ASSOCIATE")
+			clientConn.Write([]byte{0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			return
+		}
+		defer s.releaseFlow(true)
+		s.handleUDPAssociate(clientConn, udpEndpoint)
 		return
 	}
 
@@ -154,6 +249,13 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 
 	utils.Debugf("[SOCKS5] CONNECT %s", targetAddr)
 
+	if !s.reserveFlow(false) {
+		utils.Debugf("[SOCKS5] TCP flow cap reached, rejecting CONNECT %s", targetAddr)
+		clientConn.Write([]byte{0x05, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+		return
+	}
+	defer s.releaseFlow(false)
+
 	targetConn, err := s.dialer.DialTCP(targetAddr)
 	if err != nil {
 		utils.Debugf("[SOCKS5] Dial failed: %v", err)
@@ -164,25 +266,86 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 
 	clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 
+	// Either direction finishing (including on an idle/deadline error)
+	// force-closes both endpoints. Plain io.Copy + WaitGroup leaks the
+	// sibling goroutine forever when one side half-closes without the
+	// peer propagating FIN (the exact session style that accumulated
+	// 7.5 MB of stuck stacks on iOS).
+	finish := func() {
+		_ = clientConn.Close()
+		_ = targetConn.Close()
+	}
 	var wg sync.WaitGroup
 	wg.Add(2)
-
 	go func() {
 		defer wg.Done()
-		defer targetConn.Close()
-		io.Copy(targetConn, clientConn)
+		defer finish()
+		relayWithIdleTimeout(targetConn, clientConn, idle)
 	}()
-
 	go func() {
 		defer wg.Done()
-		defer clientConn.Close()
-		io.Copy(clientConn, targetConn)
+		defer finish()
+		relayWithIdleTimeout(clientConn, targetConn, idle)
 	}()
-
 	wg.Wait()
 }
 
-func (s *SOCKS5Server) handleUDPAssociate(clientConn net.Conn) {
+// reserveFlow takes a session slot honouring the per-kind and global caps.
+func (s *SOCKS5Server) reserveFlow(udp bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tcp := s.activeTCP.Load()
+	udpCount := s.activeUDP.Load()
+	maxTCP, maxUDP, maxTotal := s.limits.maxTCP, s.limits.maxUDP, s.limits.maxTotal
+	if int(tcp+udpCount) >= maxTotal {
+		return false
+	}
+	if udp {
+		if int(udpCount) >= maxUDP {
+			return false
+		}
+		s.activeUDP.Add(1)
+		return true
+	}
+	if int(tcp) >= maxTCP {
+		return false
+	}
+	s.activeTCP.Add(1)
+	return true
+}
+
+func (s *SOCKS5Server) releaseFlow(udp bool) {
+	if udp {
+		s.activeUDP.Add(-1)
+	} else {
+		s.activeTCP.Add(-1)
+	}
+}
+
+// relayWithIdleTimeout copies src -> dst, refreshing read/write deadlines on
+// every chunk so a stalled peer frees its goroutine (and the sibling copy,
+// via the shared force-close) after the idle window instead of forever.
+// Connections whose implementation ignores deadlines still unblock through
+// the peer direction closing.
+func relayWithIdleTimeout(dst, src net.Conn, timeout time.Duration) {
+	buf := make([]byte, 32*1024)
+	for {
+		now := time.Now()
+		_ = src.SetReadDeadline(now.Add(timeout))
+		_ = dst.SetWriteDeadline(now.Add(timeout))
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if rerr != nil {
+			return
+		}
+	}
+}
+
+func (s *SOCKS5Server) handleUDPAssociate(clientConn net.Conn, endpointTimeout time.Duration) {
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 	if err != nil {
 		utils.Debugf("[SOCKS5] UDP ASSOCIATE listen failed: %v", err)
@@ -215,8 +378,21 @@ func (s *SOCKS5Server) handleUDPAssociate(clientConn net.Conn) {
 		default:
 		}
 
+		// Bounded read: the control connection may legitimately carry no
+		// traffic for the associate's lifetime, so the UDP socket read is
+		// the place to re-check whether the control plane already died.
+		_ = udpConn.SetReadDeadline(time.Now().Add(endpointTimeout))
 		n, clientAddr, err := udpConn.ReadFromUDP(packet)
 		if err != nil {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				continue // refresh the endpoint liveness window
+			}
 			return
 		}
 		response, err := s.handleSOCKS5UDPDatagram(packet[:n])

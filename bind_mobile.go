@@ -744,6 +744,14 @@ func OpenFluxStats() *C.char {
 		"bytesReceived": stats.BytesReceived,
 		"reconnects":    stats.Reconnects,
 		"uptimeSeconds": int64(time.Since(client.startedAt).Seconds()),
+		// Resource observability for the mobile watchdogs (same counters
+		// that made the Cordyceps jetsam debugging tractable).
+		"numGoroutine": runtime.NumGoroutine(),
+	}
+	if client.socks != nil {
+		payload["activeTCPFlows"] = client.socks.ActiveTCPFlows()
+		payload["activeUDPFlows"] = client.socks.ActiveUDPFlows()
+		payload["activeFlows"] = client.socks.ActiveTotalFlows()
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
