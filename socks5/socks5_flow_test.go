@@ -117,7 +117,7 @@ func TestFlowCapsRejectExcessSessions(t *testing.T) {
 		return newBlockingConn(), nil
 	}}
 	server, addr := startTestServer(t, dialer, func(s *SOCKS5Server) {
-		s.SetFlowLimits(1, 8, 20, 0, 0, 0)
+		s.SetFlowLimits(1, 8, 20, 0, 0, 0, 200*time.Millisecond)
 	})
 
 	first, err := net.Dial("tcp", addr)
@@ -150,7 +150,7 @@ func TestStalledSessionFreedAfterIdleTimeout(t *testing.T) {
 	target := newBlockingConn()
 	dialer := &fakeDialer{fn: func(string) (net.Conn, error) { return target, nil }}
 	server, addr := startTestServer(t, dialer, func(s *SOCKS5Server) {
-		s.SetFlowLimits(0, 0, 0, 0, 300*time.Millisecond, 0)
+		s.SetFlowLimits(0, 0, 0, 0, 300*time.Millisecond, 0, 0)
 	})
 
 	client, err := net.Dial("tcp", addr)
@@ -183,7 +183,7 @@ func TestStalledSessionFreedAfterIdleTimeout(t *testing.T) {
 func TestHandshakeTimeoutClosesSilentConn(t *testing.T) {
 	dialer := &fakeDialer{fn: func(string) (net.Conn, error) { return newBlockingConn(), nil }}
 	_, addr := startTestServer(t, dialer, func(s *SOCKS5Server) {
-		s.SetFlowLimits(0, 0, 0, 200*time.Millisecond, 0, 0)
+		s.SetFlowLimits(0, 0, 0, 200*time.Millisecond, 0, 0, 0)
 	})
 
 	conn, err := net.Dial("tcp", addr)
@@ -202,7 +202,7 @@ func TestHandshakeTimeoutClosesSilentConn(t *testing.T) {
 func TestUDPAssociateReapedWhenIdle(t *testing.T) {
 	dialer := &fakeDialer{fn: func(string) (net.Conn, error) { return newBlockingConn(), nil }}
 	server, addr := startTestServer(t, dialer, func(s *SOCKS5Server) {
-		s.SetFlowLimits(0, 0, 0, 0, 0, 300*time.Millisecond)
+		s.SetFlowLimits(0, 0, 0, 0, 0, 300*time.Millisecond, 0)
 	})
 
 	conn, err := net.Dial("tcp", addr)
@@ -253,7 +253,7 @@ func TestUDPAssociateReapedOnNonDNSPort(t *testing.T) {
 	server, addr := startTestServer(t, dialer, func(s *SOCKS5Server) {
 		// Long endpoint timeout: only the terminal classification may
 		// reap this associate, not idleness.
-		s.SetFlowLimits(0, 0, 0, 0, 0, 30*time.Second)
+		s.SetFlowLimits(0, 0, 0, 0, 0, 30*time.Second, 0)
 	})
 
 	conn, err := net.Dial("tcp", addr)

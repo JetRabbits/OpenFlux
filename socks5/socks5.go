@@ -40,6 +40,7 @@ const (
 	DefaultHandshakeTimeout   = 10 * time.Second
 	DefaultSessionIdleTimeout = 75 * time.Second
 	DefaultUDPEndpointTimeout = 45 * time.Second
+	DefaultSlotWaitTimeout    = 30 * time.Second
 )
 
 type flowLimits struct {
@@ -49,6 +50,7 @@ type flowLimits struct {
 	handshake   time.Duration
 	idle        time.Duration
 	udpEndpoint time.Duration
+	slotWait    time.Duration
 }
 
 type SOCKS5Server struct {
@@ -82,7 +84,7 @@ func NewSOCKS5Server(addr string, dialer Dialer) *SOCKS5Server {
 // SetFlowLimits overrides the resource ceilings for tests and platform
 // bindings. Any zero/negative argument keeps the current value for that
 // field. Call before Start/StartInBackground.
-func (s *SOCKS5Server) SetFlowLimits(maxTCP, maxUDP, maxTotal int, handshake, idle, udpEndpoint time.Duration) {
+func (s *SOCKS5Server) SetFlowLimits(maxTCP, maxUDP, maxTotal int, handshake, idle, udpEndpoint, slotWait time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if maxTCP > 0 {
@@ -102,6 +104,9 @@ func (s *SOCKS5Server) SetFlowLimits(maxTCP, maxUDP, maxTotal int, handshake, id
 	}
 	if udpEndpoint > 0 {
 		s.limits.udpEndpoint = udpEndpoint
+	}
+	if slotWait > 0 {
+		s.limits.slotWait = slotWait
 	}
 }
 
@@ -285,21 +290,72 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 	}
 	var wg sync.WaitGroup
 	wg.Add(2)
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
+	bump := func() { lastActivity.Store(time.Now().UnixNano()) }
+	stalled := func() bool {
+		return time.Since(time.Unix(0, lastActivity.Load())) > idle
+	}
+	// Watchdog for sessions where BOTH directions go silent (the half-dead
+	// gvisor/relay pair that used to leak forever): close everything once
+	// the shared idle window elapses.
+	watchDone := make(chan struct{})
+	defer close(watchDone)
 	go func() {
-		defer wg.Done()
-		defer finish()
-		relayWithIdleTimeout(targetConn, clientConn, idle)
+		ticker := time.NewTicker(idle / 4)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-watchDone:
+				return
+			case <-ticker.C:
+				if stalled() {
+					_ = clientConn.Close()
+					_ = targetConn.Close()
+					return
+				}
+			}
+		}
 	}()
 	go func() {
 		defer wg.Done()
 		defer finish()
-		relayWithIdleTimeout(clientConn, targetConn, idle)
+		relayWithSessionIdle(targetConn, clientConn, idle, bump, stalled)
+	}()
+	go func() {
+		defer wg.Done()
+		defer finish()
+		relayWithSessionIdle(clientConn, targetConn, idle, bump, stalled)
 	}()
 	wg.Wait()
 }
 
 // reserveFlow takes a session slot honouring the per-kind and global caps.
+// At the ceiling the session WAITS (backpressure) rather than being
+// refused: multi-threaded clients (SpeedTest opens 20-40 TCP fan-out at
+// once) turn instant refusals into user-visible connection errors, while
+// a bounded wait just makes the burst arrive a moment later. Only after
+// slotWait elapses is the session refused.
 func (s *SOCKS5Server) reserveFlow(udp bool) bool {
+	deadline := time.Now().Add(s.slotWait())
+	for {
+		if s.tryReserveFlow(udp) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func (s *SOCKS5Server) slotWait() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.limits.slotWait
+}
+
+func (s *SOCKS5Server) tryReserveFlow(udp bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tcp := s.activeTCP.Load()
@@ -330,21 +386,27 @@ func (s *SOCKS5Server) releaseFlow(udp bool) {
 	}
 }
 
-// relayWithIdleTimeout copies src -> dst, refreshing read/write deadlines on
-// every chunk so a stalled peer frees its goroutine (and the sibling copy,
-// via the shared force-close) after the idle window instead of forever.
-// Connections whose implementation ignores deadlines still unblock through
-// the peer direction closing.
-func relayWithIdleTimeout(dst, src net.Conn, timeout time.Duration) {
+// relayWithSessionIdle copies src -> dst. The idle window is SHARED by
+// both directions (bump/stalled): a keep-alive session legitimately quiet
+// on one side survives as long as either direction moves bytes, while a
+// fully silent half-dead session is force-closed by the stalled watcher.
+// Read deadlines are per-direction guards so the copy loop itself stays
+// responsive to the shared stall signal.
+func relayWithSessionIdle(dst, src net.Conn, timeout time.Duration, bump func(), stalled func() bool) {
 	buf := make([]byte, 32*1024)
 	for {
-		now := time.Now()
-		_ = src.SetReadDeadline(now.Add(timeout))
-		_ = dst.SetWriteDeadline(now.Add(timeout))
+		_ = src.SetReadDeadline(time.Now().Add(timeout))
 		n, rerr := src.Read(buf)
 		if n > 0 {
+			bump()
+			_ = dst.SetWriteDeadline(time.Now().Add(timeout))
 			if _, werr := dst.Write(buf[:n]); werr != nil {
 				return
+			}
+			if stalled() {
+				// Another direction owns the freshness; this one is just
+				// along for the ride - keep copying.
+				continue
 			}
 		}
 		if rerr != nil {
