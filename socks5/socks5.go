@@ -32,14 +32,19 @@ const (
 	// negotiates 10-15 associates. The Cordyceps-baseline 8 starved DNS
 	// with "connection not allowed by ruleset" retry storms on first
 	// device tests. Idle/terminal reaping keeps the real steady state tiny
-	// (observed 0-3 DNS associates); the caps are emergency brakes, with
-	// worst-case cost ~48 * (32 KB copy + 128 KB gvisor buffer) ~ 8 MB.
+	// (observed 0-3 DNS associates); the caps are emergency brakes. A later
+	// device test still pinned UDP at the 32-slot cap under SpeedTest DNS
+	// churn (one associate per ephemeral source port, lingering through the
+	// 45 s idle window), starving new ASSOCIATEs until queued 30 s - past
+	// iOS' ~5 s resolver retry budget - and the test hung. UDP idle is now
+	// 15 s and the cap 64, worst-case cost ~96 * (32 KB copy + 128 KB
+	// gvisor buffer) ~ 16 MB, still inside the GOMEMLIMIT-capped heap.
 	DefaultMaxTCPFlows        = 24
-	DefaultMaxUDPFlows        = 32
-	DefaultMaxTotalFlows      = 48
+	DefaultMaxUDPFlows        = 64
+	DefaultMaxTotalFlows      = 96
 	DefaultHandshakeTimeout   = 10 * time.Second
 	DefaultSessionIdleTimeout = 75 * time.Second
-	DefaultUDPEndpointTimeout = 45 * time.Second
+	DefaultUDPEndpointTimeout = 15 * time.Second
 	DefaultSlotWaitTimeout    = 30 * time.Second
 	DefaultDialTimeout        = 10 * time.Second
 )
