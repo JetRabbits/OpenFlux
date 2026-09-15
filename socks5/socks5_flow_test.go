@@ -197,3 +197,52 @@ func TestHandshakeTimeoutClosesSilentConn(t *testing.T) {
 		t.Fatal("expected EOF/error from handshake timeout, got data")
 	}
 }
+
+func TestUDPAssociateReapedWhenIdle(t *testing.T) {
+	dialer := &fakeDialer{fn: func(string) (net.Conn, error) { return newBlockingConn(), nil }}
+	server, addr := startTestServer(t, dialer, func(s *SOCKS5Server) {
+		s.SetFlowLimits(0, 0, 0, 0, 0, 300*time.Millisecond)
+	})
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	greeting := make([]byte, 2)
+	if _, err := io.ReadFull(conn, greeting); err != nil {
+		t.Fatal(err)
+	}
+	// UDP ASSOCIATE request.
+	if _, err := conn.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply[1] != 0x00 {
+		t.Fatalf("associate should be accepted, code 0x%02x", reply[1])
+	}
+	if got := server.ActiveUDPFlows(); got != 1 {
+		t.Fatalf("associate should occupy a UDP slot, active=%d", got)
+	}
+
+	// No datagrams ever arrive: the idle endpoint timeout must reap the
+	// associate (close the control conn, free the slot) so a churn of
+	// dead gvisor UDP tunnels cannot exhaust the UDP cap and starve DNS.
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if n, err := conn.Read(make([]byte, 1)); err == nil && n > 0 {
+		t.Fatalf("idle associate was never reaped, read %d bytes", n)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for server.ActiveUDPFlows() != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := server.ActiveUDPFlows(); got != 0 {
+		t.Fatalf("idle associate slot not freed, active=%d", got)
+	}
+}

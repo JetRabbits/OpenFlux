@@ -378,20 +378,23 @@ func (s *SOCKS5Server) handleUDPAssociate(clientConn net.Conn, endpointTimeout t
 		default:
 		}
 
-		// Bounded read: the control connection may legitimately carry no
-		// traffic for the associate's lifetime, so the UDP socket read is
-		// the place to re-check whether the control plane already died.
+		// A UDP associate is cheap to recreate, so silence is treated as
+		// death: gvisor creates one associate per UDP tunnel and keeps the
+		// control connection open indefinitely, so keeping idle associates
+		// alive pin slots (each with a socket + goroutine) and starve new
+		// flows - a single stuck batch exhausted the UDP cap and killed
+		// DNS on device. Idle endpoints are reaped; the next datagram
+		// transparently negotiates a fresh associate.
 		_ = udpConn.SetReadDeadline(time.Now().Add(endpointTimeout))
 		n, clientAddr, err := udpConn.ReadFromUDP(packet)
 		if err != nil {
 			select {
 			case <-done:
-				return
 			default:
-			}
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
-				continue // refresh the endpoint liveness window
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					utils.Debugf("[SOCKS5] UDP associate idle for %s, reaping", endpointTimeout)
+				}
 			}
 			return
 		}
