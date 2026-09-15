@@ -343,3 +343,40 @@ func TestDefaultLimitsArePopulated(t *testing.T) {
 		t.Fatalf("non-positive default caps: %+v", s.limits)
 	}
 }
+
+type eofOnReadConn struct{ *blockingConn }
+
+func (c *eofOnReadConn) Read([]byte) (int, error) { return 0, io.EOF }
+
+func TestHalfCloseFreesSlotImmediately(t *testing.T) {
+	// Device regression: SpeedTest servers send FIN right after the
+	// response while the client keeps the socket silently open. The first
+	// copy to finish must force-close both ends and free the slot at once;
+	// waiting for the mutual-silence timer instead pinned all 24 TCP slots
+	// and the tunnel presented as "no connection" at a healthy 27 MB.
+	target := &eofOnReadConn{blockingConn: newBlockingConn()}
+	dialer := &fakeDialer{fn: func(string) (net.Conn, error) { return target, nil }}
+	server, addr := startTestServer(t, dialer, func(s *SOCKS5Server) {
+		// Idle window deliberately huge: only EOF propagation can free
+		// the slot within the test's 2 s budget.
+		s.SetFlowLimits(0, 0, 0, 0, 10*time.Second, 0, 0, 0)
+	})
+
+	client, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if code := socksHandshake(t, client, "example.com:443"); code != 0x00 {
+		t.Fatalf("session should be accepted, got 0x%02x", code)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if server.ActiveTCPFlows() == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("target-side EOF must free the slot immediately; flow still pinned")
+}

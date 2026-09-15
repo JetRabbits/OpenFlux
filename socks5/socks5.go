@@ -335,9 +335,18 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 			}
 		}
 	}()
+	// First direction to finish (FIN or error) force-closes BOTH endpoints.
+	// A device SpeedTest proved that waiting for the mutual-silence timer
+	// instead pins slots: the test fan-out accumulated 24 half-closed
+	// sessions (server FIN, client keep-alive silent), saturated the TCP cap
+	// and the tunnel presented as "no connection" while memory was a
+	// healthy 27 MB. Half-close-then-continue is not a pattern real app
+	// traffic relies on through this proxy; Cordyceps uses the same rule.
 	go func() {
 		defer wg.Done()
 		defer finish()
+		defer clientConn.Close()
+		defer targetConn.Close()
 		relayWithSessionIdle(targetConn, clientConn, idle, func(n int) {
 			lastActivity.Store(time.Now().UnixNano())
 			up.Add(int64(n))
@@ -346,6 +355,8 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 	go func() {
 		defer wg.Done()
 		defer finish()
+		defer clientConn.Close()
+		defer targetConn.Close()
 		relayWithSessionIdle(clientConn, targetConn, idle, func(n int) {
 			lastActivity.Store(time.Now().UnixNano())
 			down.Add(int64(n))
