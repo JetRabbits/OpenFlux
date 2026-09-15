@@ -292,10 +292,16 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 	wg.Add(2)
 	var lastActivity atomic.Int64
 	lastActivity.Store(time.Now().UnixNano())
-	bump := func() { lastActivity.Store(time.Now().UnixNano()) }
 	stalled := func() bool {
 		return time.Since(time.Unix(0, lastActivity.Load())) > idle
 	}
+	var up, down atomic.Int64
+	started := time.Now()
+	defer func() {
+		utils.Debugf("[SOCKS5] session %s ended after %s up=%d down=%d",
+			targetAddr, time.Since(started).Round(time.Millisecond),
+			up.Load(), down.Load())
+	}()
 	// Watchdog for sessions where BOTH directions go silent (the half-dead
 	// gvisor/relay pair that used to leak forever): close everything once
 	// the shared idle window elapses.
@@ -320,12 +326,18 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 	go func() {
 		defer wg.Done()
 		defer finish()
-		relayWithSessionIdle(targetConn, clientConn, idle, bump, stalled)
+		relayWithSessionIdle(targetConn, clientConn, idle, func(n int) {
+			lastActivity.Store(time.Now().UnixNano())
+			up.Add(int64(n))
+		}, stalled)
 	}()
 	go func() {
 		defer wg.Done()
 		defer finish()
-		relayWithSessionIdle(clientConn, targetConn, idle, bump, stalled)
+		relayWithSessionIdle(clientConn, targetConn, idle, func(n int) {
+			lastActivity.Store(time.Now().UnixNano())
+			down.Add(int64(n))
+		}, stalled)
 	}()
 	wg.Wait()
 }
@@ -392,13 +404,13 @@ func (s *SOCKS5Server) releaseFlow(udp bool) {
 // fully silent half-dead session is force-closed by the stalled watcher.
 // Read deadlines are per-direction guards so the copy loop itself stays
 // responsive to the shared stall signal.
-func relayWithSessionIdle(dst, src net.Conn, timeout time.Duration, bump func(), stalled func() bool) {
+func relayWithSessionIdle(dst, src net.Conn, timeout time.Duration, bump func(int), stalled func() bool) {
 	buf := make([]byte, 32*1024)
 	for {
 		_ = src.SetReadDeadline(time.Now().Add(timeout))
 		n, rerr := src.Read(buf)
 		if n > 0 {
-			bump()
+			bump(n)
 			_ = dst.SetWriteDeadline(time.Now().Add(timeout))
 			if _, werr := dst.Write(buf[:n]); werr != nil {
 				return
