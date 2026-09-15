@@ -46,7 +46,7 @@ const (
 	DefaultSessionIdleTimeout = 75 * time.Second
 	DefaultUDPEndpointTimeout = 15 * time.Second
 	DefaultSlotWaitTimeout    = 30 * time.Second
-	DefaultDialTimeout        = 10 * time.Second
+	DefaultDialTimeout        = 20 * time.Second
 )
 
 type flowLimits struct {
