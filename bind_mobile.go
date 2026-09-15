@@ -590,6 +590,11 @@ func StartOpenFluxClient(
 	}
 	if debug != 0 {
 		utils.EnableDebug()
+		// Per-packet dumps inside a NetworkExtension / VpnService process
+		// cause allocation storms that push the footprint past the iOS jetsam
+		// limit (observed NE kill at ~52 MB during SpeedTest with Debug=true).
+		// Keep diagnostics useful while bounding log-driven work.
+		utils.SetDebugRateLimit(25)
 	}
 	utils.Debugf("[MOBILE] OpenFlux client start: entered transport=%s socks=%s", transportType, socksAddr)
 
