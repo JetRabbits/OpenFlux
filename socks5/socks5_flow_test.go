@@ -117,7 +117,7 @@ func TestFlowCapsRejectExcessSessions(t *testing.T) {
 		return newBlockingConn(), nil
 	}}
 	server, addr := startTestServer(t, dialer, func(s *SOCKS5Server) {
-		s.SetFlowLimits(1, 8, 20, 0, 0, 0, 200*time.Millisecond)
+		s.SetFlowLimits(1, 8, 20, 0, 0, 0, 200*time.Millisecond, 0)
 	})
 
 	first, err := net.Dial("tcp", addr)
@@ -146,11 +146,40 @@ func TestFlowCapsRejectExcessSessions(t *testing.T) {
 	}
 }
 
+func TestDialTimeoutFreesSlot(t *testing.T) {
+	blocked := make(chan struct{})
+	dialer := &fakeDialer{fn: func(string) (net.Conn, error) {
+		<-blocked // never returns until the test ends
+		return nil, io.EOF
+	}}
+	server, addr := startTestServer(t, dialer, func(s *SOCKS5Server) {
+		s.SetFlowLimits(0, 0, 0, 0, 300*time.Millisecond, 0, 0, 0)
+	})
+	defer close(blocked)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	code := socksHandshake(t, conn, "example.com:443")
+	if code != 0x04 {
+		t.Fatalf("timed-out dial should reply host-unreachable 0x04, got 0x%02x", code)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for server.ActiveTotalFlows() != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := server.ActiveTotalFlows(); got != 0 {
+		t.Fatalf("stuck dial kept the flow slot, active=%d", got)
+	}
+}
+
 func TestStalledSessionFreedAfterIdleTimeout(t *testing.T) {
 	target := newBlockingConn()
 	dialer := &fakeDialer{fn: func(string) (net.Conn, error) { return target, nil }}
 	server, addr := startTestServer(t, dialer, func(s *SOCKS5Server) {
-		s.SetFlowLimits(0, 0, 0, 0, 300*time.Millisecond, 0, 0)
+		s.SetFlowLimits(0, 0, 0, 0, 300*time.Millisecond, 0, 0, 0)
 	})
 
 	client, err := net.Dial("tcp", addr)
@@ -183,7 +212,7 @@ func TestStalledSessionFreedAfterIdleTimeout(t *testing.T) {
 func TestHandshakeTimeoutClosesSilentConn(t *testing.T) {
 	dialer := &fakeDialer{fn: func(string) (net.Conn, error) { return newBlockingConn(), nil }}
 	_, addr := startTestServer(t, dialer, func(s *SOCKS5Server) {
-		s.SetFlowLimits(0, 0, 0, 200*time.Millisecond, 0, 0, 0)
+		s.SetFlowLimits(0, 0, 0, 200*time.Millisecond, 0, 0, 0, 0)
 	})
 
 	conn, err := net.Dial("tcp", addr)
@@ -202,7 +231,7 @@ func TestHandshakeTimeoutClosesSilentConn(t *testing.T) {
 func TestUDPAssociateReapedWhenIdle(t *testing.T) {
 	dialer := &fakeDialer{fn: func(string) (net.Conn, error) { return newBlockingConn(), nil }}
 	server, addr := startTestServer(t, dialer, func(s *SOCKS5Server) {
-		s.SetFlowLimits(0, 0, 0, 0, 0, 300*time.Millisecond, 0)
+		s.SetFlowLimits(0, 0, 0, 0, 0, 300*time.Millisecond, 0, 0)
 	})
 
 	conn, err := net.Dial("tcp", addr)
@@ -253,7 +282,7 @@ func TestUDPAssociateReapedOnNonDNSPort(t *testing.T) {
 	server, addr := startTestServer(t, dialer, func(s *SOCKS5Server) {
 		// Long endpoint timeout: only the terminal classification may
 		// reap this associate, not idleness.
-		s.SetFlowLimits(0, 0, 0, 0, 0, 30*time.Second, 0)
+		s.SetFlowLimits(0, 0, 0, 0, 0, 30*time.Second, 0, 0)
 	})
 
 	conn, err := net.Dial("tcp", addr)
@@ -299,5 +328,18 @@ func TestUDPAssociateReapedOnNonDNSPort(t *testing.T) {
 	}
 	if got := server.ActiveUDPFlows(); got != 0 {
 		t.Fatalf("non-DNS associate slot not freed, active=%d", got)
+	}
+}
+
+func TestDefaultLimitsArePopulated(t *testing.T) {
+	// Regression guard: defaults once silently lost their literal and
+	// dialTimeout=0 made time.After(0) reject every dial instantly.
+	s := NewSOCKS5Server("127.0.0.1:0", &fakeDialer{})
+	if s.limits.dialTimeout <= 0 || s.limits.slotWait <= 0 ||
+		s.limits.handshake <= 0 || s.limits.idle <= 0 || s.limits.udpEndpoint <= 0 {
+		t.Fatalf("zero-valued default limits: %+v", s.limits)
+	}
+	if s.limits.maxTCP <= 0 || s.limits.maxUDP <= 0 || s.limits.maxTotal <= 0 {
+		t.Fatalf("non-positive default caps: %+v", s.limits)
 	}
 }

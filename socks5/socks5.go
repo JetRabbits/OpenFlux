@@ -41,6 +41,7 @@ const (
 	DefaultSessionIdleTimeout = 75 * time.Second
 	DefaultUDPEndpointTimeout = 45 * time.Second
 	DefaultSlotWaitTimeout    = 30 * time.Second
+	DefaultDialTimeout        = 10 * time.Second
 )
 
 type flowLimits struct {
@@ -51,6 +52,7 @@ type flowLimits struct {
 	idle        time.Duration
 	udpEndpoint time.Duration
 	slotWait    time.Duration
+	dialTimeout time.Duration
 }
 
 type SOCKS5Server struct {
@@ -77,6 +79,8 @@ func NewSOCKS5Server(addr string, dialer Dialer) *SOCKS5Server {
 			handshake:   DefaultHandshakeTimeout,
 			idle:        DefaultSessionIdleTimeout,
 			udpEndpoint: DefaultUDPEndpointTimeout,
+			slotWait:    DefaultSlotWaitTimeout,
+			dialTimeout: DefaultDialTimeout,
 		},
 	}
 }
@@ -84,7 +88,7 @@ func NewSOCKS5Server(addr string, dialer Dialer) *SOCKS5Server {
 // SetFlowLimits overrides the resource ceilings for tests and platform
 // bindings. Any zero/negative argument keeps the current value for that
 // field. Call before Start/StartInBackground.
-func (s *SOCKS5Server) SetFlowLimits(maxTCP, maxUDP, maxTotal int, handshake, idle, udpEndpoint, slotWait time.Duration) {
+func (s *SOCKS5Server) SetFlowLimits(maxTCP, maxUDP, maxTotal int, handshake, idle, udpEndpoint, slotWait, dialTimeout time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if maxTCP > 0 {
@@ -107,6 +111,9 @@ func (s *SOCKS5Server) SetFlowLimits(maxTCP, maxUDP, maxTotal int, handshake, id
 	}
 	if slotWait > 0 {
 		s.limits.slotWait = slotWait
+	}
+	if dialTimeout > 0 {
+		s.limits.dialTimeout = dialTimeout
 	}
 }
 
@@ -269,7 +276,7 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 	}
 	defer s.releaseFlow(false)
 
-	targetConn, err := s.dialer.DialTCP(targetAddr)
+	targetConn, err := s.dialWithTimeout(targetAddr)
 	if err != nil {
 		utils.Debugf("[SOCKS5] Dial failed: %v", err)
 		clientConn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
@@ -340,6 +347,42 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 		}, stalled)
 	}()
 	wg.Wait()
+}
+
+// dialWithTimeout bounds the transport dial. A half-dead carrier channel
+// can make DialTCP block indefinitely; without this deadline every stuck
+// dial silently pins a flow slot, and within seconds the caps are fully
+// consumed by zombies - which on device presented as complete traffic
+// loss while the tunnel itself looked healthy. The abandoned dial, if it
+// ever completes, has its connection closed here.
+func (s *SOCKS5Server) dialWithTimeout(targetAddr string) (net.Conn, error) {
+	dialTimeout := func() time.Duration {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.limits.dialTimeout
+	}()
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	result := make(chan dialResult, 1)
+	go func() {
+		conn, err := s.dialer.DialTCP(targetAddr)
+		result <- dialResult{conn: conn, err: err}
+	}()
+	select {
+	case r := <-result:
+		return r.conn, r.err
+	case <-time.After(dialTimeout):
+		go func() {
+			r := <-result
+			if r.conn != nil {
+				_ = r.conn.Close()
+			}
+		}()
+		return nil, fmt.Errorf("dial %s timed out after %s", targetAddr, dialTimeout)
+	}
 }
 
 // reserveFlow takes a session slot honouring the per-kind and global caps.
