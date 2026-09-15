@@ -48,11 +48,11 @@ func (c *blockingConn) isClosed() bool {
 	return c.closed
 }
 
-func (c *blockingConn) LocalAddr() net.Addr                { return &net.TCPAddr{} }
-func (c *blockingConn) RemoteAddr() net.Addr               { return &net.TCPAddr{} }
-func (c *blockingConn) SetDeadline(time.Time) error        { return nil }
-func (c *blockingConn) SetReadDeadline(time.Time) error    { return nil }
-func (c *blockingConn) SetWriteDeadline(time.Time) error   { return nil }
+func (c *blockingConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *blockingConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *blockingConn) SetDeadline(time.Time) error      { return nil }
+func (c *blockingConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *blockingConn) SetWriteDeadline(time.Time) error { return nil }
 
 type fakeDialer struct {
 	fn func(address string) (net.Conn, error)
@@ -244,5 +244,59 @@ func TestUDPAssociateReapedWhenIdle(t *testing.T) {
 	}
 	if got := server.ActiveUDPFlows(); got != 0 {
 		t.Fatalf("idle associate slot not freed, active=%d", got)
+	}
+}
+
+func TestUDPAssociateReapedOnNonDNSPort(t *testing.T) {
+	dialer := &fakeDialer{fn: func(string) (net.Conn, error) { return newBlockingConn(), nil }}
+	server, addr := startTestServer(t, dialer, func(s *SOCKS5Server) {
+		// Long endpoint timeout: only the terminal classification may
+		// reap this associate, not idleness.
+		s.SetFlowLimits(0, 0, 0, 0, 0, 30*time.Second)
+	})
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(conn, make([]byte, 2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(conn, reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply[1] != 0x00 {
+		t.Fatalf("associate should be accepted, code 0x%02x", reply[1])
+	}
+	relayPort := int(reply[8])<<8 | int(reply[9])
+
+	udp, err := net.Dial("udp", fmt.Sprintf("127.0.0.1:%d", relayPort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	datagram := []byte{0, 0, 0, 1, 127, 0, 0, 1, 1, 0xbb} // => dest port 443
+	if _, err := udp.Write(append(datagram, 0xde, 0xad)); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if n, err := conn.Read(make([]byte, 1)); err == nil && n > 0 {
+		t.Fatalf("non-DNS associate was not reaped, read %d bytes", n)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for server.ActiveUDPFlows() != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := server.ActiveUDPFlows(); got != 0 {
+		t.Fatalf("non-DNS associate slot not freed, active=%d", got)
 	}
 }

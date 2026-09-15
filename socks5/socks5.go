@@ -400,6 +400,19 @@ func (s *SOCKS5Server) handleUDPAssociate(clientConn net.Conn, endpointTimeout t
 		}
 		response, err := s.handleSOCKS5UDPDatagram(packet[:n])
 		if err != nil {
+			// gvisor creates one UDP tunnel per destination: a tunnel whose
+			// first datagram targets a non-DNS port (QUIC :443 churn, etc.)
+			// can never carry useful traffic through this DNS-only relay,
+			// yet every such datagram refreshed the associate's idle window
+			// and pinned the slot forever - on device that filled the UDP
+			// cap and starved DNS. Reap it on first sight instead; gvisor
+			// tears the flow down on the next write error and would create
+			// a fresh associate for any genuinely useful tunnel.
+			var derr *dgramError
+			if errors.As(err, &derr) && derr.terminal {
+				utils.Debugf("[SOCKS5] UDP associate targets port %d (not DNS), reaping", derr.port)
+				return
+			}
 			utils.Debugf("[SOCKS5] UDP datagram ignored: %v", err)
 			continue
 		}
@@ -407,16 +420,27 @@ func (s *SOCKS5Server) handleUDPAssociate(clientConn net.Conn, endpointTimeout t
 	}
 }
 
+// dgramError classifies a rejected datagram: terminal when the tunnel can
+// never become useful (non-DNS destination port), transient otherwise.
+type dgramError struct {
+	port     uint16
+	terminal bool
+	msg      string
+}
+
+func (e *dgramError) Error() string { return e.msg }
+
 func (s *SOCKS5Server) handleSOCKS5UDPDatagram(packet []byte) ([]byte, error) {
 	if len(packet) < 10 || packet[0] != 0 || packet[1] != 0 || packet[2] != 0 {
 		return nil, fmt.Errorf("invalid UDP header")
 	}
 	if packet[3] != 0x01 {
-		return nil, fmt.Errorf("only IPv4 UDP targets are supported")
+		return nil, &dgramError{terminal: true, msg: "only IPv4 UDP targets are supported"}
 	}
 	port := binary.BigEndian.Uint16(packet[8:10])
 	if port != 53 {
-		return nil, fmt.Errorf("only DNS UDP/53 is supported, got %d", port)
+		return nil, &dgramError{port: port, terminal: true,
+			msg: fmt.Sprintf("only DNS UDP/53 is supported, got %d", port)}
 	}
 	dnsPayload := packet[10:]
 	dnsResponse, err := resolveDNSQuery(dnsPayload)
