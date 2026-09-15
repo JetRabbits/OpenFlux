@@ -74,8 +74,9 @@ var mobileState struct {
 // once, synchronously, because there is no second Go runtime to conflict
 // with.
 type fluxTun2SocksClient struct {
-	device t2device.Device
-	stack  *gvstack.Stack
+	device  t2device.Device
+	stack   *gvstack.Stack
+	handler *t2tunnel.Tunnel
 	// packetRW is non-nil only for the iOS NetworkExtension packet-flow
 	// variant (StartFluxTun2SocksPacketFlow); the Android fd-based variant
 	// (StartFluxTun2SocksWithFd) leaves it nil.
@@ -266,10 +267,10 @@ func StartFluxTun2SocksWithFd(tunFd C.int, socksAddrC *C.char, mtuC C.int) *C.ch
 	// sizes framed into trans.Send()) for connections relayed through this
 	// bridge — see TCPTunnel.SetMTU()'s doc comment.
 	mobileState.Lock()
-	client := mobileState.client
+	mobileClient := mobileState.client
 	mobileState.Unlock()
-	if client != nil && client.tunnel != nil {
-		client.tunnel.SetMTU(uint32(mtu))
+	if mobileClient != nil && mobileClient.tunnel != nil {
+		mobileClient.tunnel.SetMTU(uint32(mtu))
 	}
 
 	dev, err := fdbased.Open(strconv.Itoa(int(tunFd)), uint32(mtu), 0)
@@ -302,7 +303,7 @@ func StartFluxTun2SocksWithFd(tunFd C.int, socksAddrC *C.char, mtuC C.int) *C.ch
 		return cStringOrNil(fmt.Sprintf("create tun2socks stack: %v", err))
 	}
 
-	fluxTun2Socks.client = &fluxTun2SocksClient{device: dev, stack: stk}
+	fluxTun2Socks.client = &fluxTun2SocksClient{device: dev, stack: stk, handler: handler}
 	return nil
 }
 
@@ -323,56 +324,93 @@ func StartFluxTun2SocksPacketFlow(socksAddrC *C.char, mtuC C.int) *C.char {
 		mtu = 1500
 	}
 
+	utils.Debugf("[MOBILE] Flux packet-flow tun2socks start: entered socks=%s mtu=%d", socksAddr, mtu)
 	fluxTun2Socks.Lock()
-	defer fluxTun2Socks.Unlock()
-
 	stopFluxTun2SocksLocked()
+	utils.Debugf("[MOBILE] Flux packet-flow tun2socks start: old instance stopped")
 	statistic.DefaultManager.ResetStatistic()
 
 	mobileState.Lock()
-	client := mobileState.client
+	mobileClient := mobileState.client
 	mobileState.Unlock()
-	if client != nil && client.tunnel != nil {
-		client.tunnel.SetMTU(uint32(mtu))
+	if mobileClient != nil && mobileClient.tunnel != nil {
+		mobileClient.tunnel.SetMTU(uint32(mtu))
 	}
 
 	rw := newFluxPacketFlowReadWriter()
 	endpoint, err := iobased.New(rw, uint32(mtu), 0)
 	if err != nil {
+		fluxTun2Socks.Unlock()
 		rw.Close()
 		return cStringOrNil(fmt.Sprintf("open packet flow device: %v", err))
 	}
+	utils.Debugf("[MOBILE] Flux packet-flow tun2socks start: iobased endpoint created")
 	dev := &fluxPacketFlowDevice{Endpoint: endpoint}
 
 	proxyURL, err := url.Parse("socks5://" + socksAddr)
 	if err != nil {
+		fluxTun2Socks.Unlock()
 		dev.Close()
 		rw.Close()
 		return cStringOrNil(fmt.Sprintf("parse socks proxy: %v", err))
 	}
+	utils.Debugf("[MOBILE] Flux packet-flow tun2socks start: proxy URL parsed")
 	proxy, err := t2proxy.Parse(proxyURL)
 	if err != nil {
+		fluxTun2Socks.Unlock()
 		dev.Close()
 		rw.Close()
 		return cStringOrNil(fmt.Sprintf("create socks proxy: %v", err))
 	}
+	utils.Debugf("[MOBILE] Flux packet-flow tun2socks start: proxy created")
 
 	handler := t2tunnel.New(proxy, statistic.DefaultManager)
 	handler.ProcessAsync()
+	utils.Debugf("[MOBILE] Flux packet-flow tun2socks start: handler ProcessAsync returned")
 
-	stk, err := t2core.CreateStack(&t2core.Config{
-		LinkEndpoint:     dev,
-		TransportHandler: handler,
-		Options:          fluxTun2SocksStackOptions(),
-	})
-	if err != nil {
-		handler.Close()
-		dev.Close()
-		rw.Close()
-		return cStringOrNil(fmt.Sprintf("create tun2socks stack: %v", err))
-	}
+	client := &fluxTun2SocksClient{device: dev, handler: handler, packetRW: rw}
+	fluxTun2Socks.client = client
+	fluxTun2Socks.Unlock()
 
-	fluxTun2Socks.client = &fluxTun2SocksClient{device: dev, stack: stk, packetRW: rw}
+	// On iOS this exported C function is called from startTunnel's startup path.
+	// tun2socks/gVisor stack creation attaches the iobased endpoint and starts
+	// packet goroutines; on real NetworkExtension packet-flow this can block below
+	// Go while waiting on the endpoint. Do the attach/create phase off the cgo
+	// caller and publish the stack only if this is still the active generation.
+	go func() {
+		utils.Debugf("[MOBILE] Flux packet-flow tun2socks start: creating stack")
+		stk, err := t2core.CreateStack(&t2core.Config{
+			LinkEndpoint:     dev,
+			TransportHandler: handler,
+			Options:          fluxTun2SocksStackOptions(),
+		})
+		if err != nil {
+			utils.Debugf("[MOBILE] Flux packet-flow tun2socks start: create stack failed: %v", err)
+			fluxTun2Socks.Lock()
+			if fluxTun2Socks.client == client {
+				fluxTun2Socks.client = nil
+			}
+			fluxTun2Socks.Unlock()
+			handler.Close()
+			dev.Close()
+			rw.Close()
+			return
+		}
+
+		fluxTun2Socks.Lock()
+		if fluxTun2Socks.client != client {
+			fluxTun2Socks.Unlock()
+			utils.Debugf("[MOBILE] Flux packet-flow tun2socks start: stack created for stale instance; closing")
+			stk.Close()
+			stk.Wait()
+			return
+		}
+		client.stack = stk
+		fluxTun2Socks.Unlock()
+		utils.Debugf("[MOBILE] Flux packet-flow tun2socks start: stack assigned")
+	}()
+
+	utils.Debugf("[MOBILE] Flux packet-flow tun2socks start: returning success")
 	return nil
 }
 
@@ -482,15 +520,27 @@ func stopFluxTun2SocksLocked() {
 		return
 	}
 	fluxTun2Socks.client = nil
-	if client.stack != nil {
-		client.stack.Close()
-		client.stack.Wait()
+	if client.handler != nil {
+		client.handler.Close()
+	}
+	if client.packetRW != nil {
+		client.packetRW.Close()
 	}
 	if client.device != nil {
 		client.device.Close()
 	}
-	if client.packetRW != nil {
-		client.packetRW.Close()
+	if client.stack != nil {
+		client.stack.Close()
+		done := make(chan struct{})
+		go func() {
+			client.stack.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			utils.Debugf("[MOBILE] Flux tun2socks stop: timed out waiting for stack shutdown")
+		}
 	}
 }
 
@@ -518,11 +568,11 @@ func StartOpenFluxClient(
 	debug C.int,
 ) *C.char {
 	mobileState.Lock()
-	defer mobileState.Unlock()
-
 	if mobileState.client != nil {
+		mobileState.Unlock()
 		return cStringOrNil("openflux client is already running")
 	}
+	mobileState.Unlock()
 
 	transportType := strings.TrimSpace(strings.ToLower(cstr(transportC)))
 	if transportType == "" {
@@ -532,10 +582,10 @@ func StartOpenFluxClient(
 	if socksAddr == "" {
 		socksAddr = "127.0.0.1:1080"
 	}
-
 	if debug != 0 {
 		utils.EnableDebug()
 	}
+	utils.Debugf("[MOBILE] OpenFlux client start: entered transport=%s socks=%s", transportType, socksAddr)
 
 	config := transport.DefaultConfig()
 	var trans transport.Transport
@@ -543,36 +593,60 @@ func StartOpenFluxClient(
 	case "yandex":
 		docURL := strings.TrimSpace(cstr(urlC))
 		if docURL == "" {
+			utils.Debugf("[MOBILE] OpenFlux client start failed: %s", "yandex transport requires url")
 			return cStringOrNil("OpenFlux yandex transport requires url")
 		}
 		trans = yandex.NewYandexDocsTransport(docURL, config)
 	case "oneme":
 		uid, err := strconv.ParseInt(strings.TrimSpace(cstr(maxUidC)), 10, 64)
 		if err != nil {
+			utils.Debugf("[MOBILE] OpenFlux client start failed: oneme maxUid %q: %v", cstr(maxUidC), err)
 			return cStringOrNil(fmt.Sprintf("OpenFlux oneme transport requires numeric maxUid: %v", err))
 		}
 		trans = oneme.NewOneMeTransport(false, cstr(maxTokenC), uid, config)
 	default:
+		utils.Debugf("[MOBILE] OpenFlux client start failed: %s", fmt.Sprintf("unsupported OpenFlux transport %q", transportType))
 		return cStringOrNil(fmt.Sprintf("unsupported OpenFlux transport %q", transportType))
 	}
 
-	if err := trans.Start(); err != nil {
-		return cStringOrNil(fmt.Sprintf("start transport: %v", err))
-	}
-
+	utils.Debugf("[MOBILE] OpenFlux client start: transport created")
 	tun := tunnel.NewTCPTunnel(trans, false)
+	utils.Debugf("[MOBILE] OpenFlux client start: TCP tunnel created")
 	server := socks5.NewSOCKS5Server(socksAddr, tun)
 	if err := server.StartInBackground(); err != nil {
+		utils.Debugf("[MOBILE] OpenFlux client start failed: start socks5 listener on %s: %v", socksAddr, err)
 		_ = trans.Stop()
 		return cStringOrNil(fmt.Sprintf("start socks5: %v", err))
 	}
+	utils.Debugf("[MOBILE] OpenFlux client start: SOCKS listener ready")
 
-	mobileState.client = &mobileClientState{
+	client := &mobileClientState{
 		transport: trans,
 		tunnel:    tun,
 		socks:     server,
 		startedAt: time.Now(),
 	}
+	mobileState.Lock()
+	if mobileState.client != nil {
+		mobileState.Unlock()
+		_ = server.Close()
+		_ = trans.Stop()
+		utils.Debugf("[MOBILE] OpenFlux client start failed: %s", "openflux client is already running")
+		return cStringOrNil("openflux client is already running")
+	}
+	mobileState.client = client
+	mobileState.Unlock()
+	utils.Debugf("[MOBILE] OpenFlux client start: client ready")
+
+	// Carrier discovery/handshake remains asynchronous. The exported call only
+	// waits until the local SOCKS5 listener is actually accepting connections.
+	go func() {
+		if err := trans.Start(); err != nil {
+			utils.Debugf("[MOBILE] OpenFlux transport start failed: %v", err)
+			_ = StopOpenFluxClient()
+		}
+	}()
+	utils.Debugf("[MOBILE] OpenFlux client start: returning ready")
 	return nil
 }
 
