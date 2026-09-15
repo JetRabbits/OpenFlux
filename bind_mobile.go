@@ -8,6 +8,7 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"runtime"
 	"strconv"
@@ -57,6 +58,11 @@ var mobileState struct {
 	sync.Mutex
 	client *mobileClientState
 }
+
+// actualSocksPort is the TCP port the Flux SOCKS5 listener actually bound to.
+// It equals the requested port unless the ephemeral fallback kicked in; 0
+// means "no client running / unknown". Read from C via OpenFluxSocksPort().
+var actualSocksPort atomic.Int32
 
 // fluxTun2SocksState holds the Android TUN<->local-SOCKS5 bridge for Flux.
 //
@@ -612,6 +618,33 @@ func StartOpenFluxClient(
 	utils.Debugf("[MOBILE] OpenFlux client start: transport created")
 	tun := tunnel.NewTCPTunnel(trans, false)
 	utils.Debugf("[MOBILE] OpenFlux client start: TCP tunnel created")
+	// iOS loopback is device-wide: the requested SOCKS5 port can already be
+	// held by another process (this app's own Cordyceps runner has been seen
+	// squatting on the 127.0.0.1:1080 default, and unrelated third-party
+	// apps bind it too). Treat "port in use" as a soft condition: probe the
+	// requested port first and fall back to an ephemeral 127.0.0.1 port so a
+	// busy port never bricks Flux. C callers read the real bound port via
+	// OpenFluxSocksPort() and must use it for the tun2socks bridge.
+	if probe, perr := net.Listen("tcp", socksAddr); perr == nil {
+		_ = probe.Close()
+	} else {
+		host, _, perr2 := net.SplitHostPort(socksAddr)
+		if perr2 != nil {
+			utils.Debugf("[MOBILE] OpenFlux client start failed: socks address %q: %v", socksAddr, perr2)
+			_ = trans.Stop()
+			return cStringOrNil(fmt.Sprintf("socks address %q: %v", socksAddr, perr2))
+		}
+		probe, perr2 = net.Listen("tcp", net.JoinHostPort(host, "0"))
+		if perr2 != nil {
+			utils.Debugf("[MOBILE] OpenFlux client start failed: socks bind on %s also failed (requested %s): %v", host, socksAddr, perr2)
+			_ = trans.Stop()
+			return cStringOrNil(fmt.Sprintf("start socks5: %v (requested %s)", perr, socksAddr))
+		}
+		fallbackAddr := probe.Addr().String()
+		_ = probe.Close()
+		utils.Debugf("[MOBILE] OpenFlux client start: socks %s in use (%v), falling back to %s", socksAddr, perr, fallbackAddr)
+		socksAddr = fallbackAddr
+	}
 	server := socks5.NewSOCKS5Server(socksAddr, tun)
 	if err := server.StartInBackground(); err != nil {
 		utils.Debugf("[MOBILE] OpenFlux client start failed: start socks5 listener on %s: %v", socksAddr, err)
@@ -619,6 +652,10 @@ func StartOpenFluxClient(
 		return cStringOrNil(fmt.Sprintf("start socks5: %v", err))
 	}
 	utils.Debugf("[MOBILE] OpenFlux client start: SOCKS listener ready")
+	if _, portStr, perr := net.SplitHostPort(socksAddr); perr == nil {
+		port, _ := strconv.Atoi(portStr)
+		actualSocksPort.Store(int32(port))
+	}
 
 	client := &mobileClientState{
 		transport: trans,
@@ -652,6 +689,7 @@ func StartOpenFluxClient(
 
 //export StopOpenFluxClient
 func StopOpenFluxClient() *C.char {
+	actualSocksPort.Store(0)
 	mobileState.Lock()
 	client := mobileState.client
 	mobileState.client = nil
@@ -677,6 +715,11 @@ func StopOpenFluxClient() *C.char {
 		return cStringOrNil(strings.Join(warnings, "; "))
 	}
 	return nil
+}
+
+//export OpenFluxSocksPort
+func OpenFluxSocksPort() C.int {
+	return C.int(actualSocksPort.Load())
 }
 
 //export OpenFluxStats
