@@ -37,11 +37,23 @@ const (
 	// churn (one associate per ephemeral source port, lingering through the
 	// 45 s idle window), starving new ASSOCIATEs until queued 30 s - past
 	// iOS' ~5 s resolver retry budget - and the test hung. UDP idle is now
-	// 15 s and the cap 64, worst-case cost ~96 * (32 KB copy + 128 KB
-	// gvisor buffer) ~ 16 MB, still inside the GOMEMLIMIT-capped heap.
-	DefaultMaxTCPFlows        = 24
+	// 15 s and the cap 64.
+	//
+	// The TCP cap was 24 until an iPhone running the Ookla SpeedTest app
+	// (multi-connection mode) pinned it for 10 consecutive watchdog ticks and
+	// started answering real dials with `[SOCKS5] TCP flow cap reached,
+	// rejecting CONNECT` -> `CONNECT: connection not allowed by ruleset`, which
+	// is what the user saw as "the test failed to connect". Memory was NOT the
+	// constraint in that run: footprint peaked at 25.95 MB against the ~50 MB
+	// limit, live heap ~7 MB, non-Go only 1.9-2.1 MB (tick-by-tick task_info
+	// split). Raised to 48 because the per-flow price dropped when the relay
+	// chunk went 32 KiB -> 8 KiB: worst case per TCP flow is now ~150 KB
+	// (2x8 KiB relay copy + 4 KiB initial / 64 KiB max gvisor buffers, autotune
+	// off), so 48 flows are ~7 MB - affordable at the measured plateau, and the
+	// watchdog now logs the split needed to re-check that claim after a change.
+	DefaultMaxTCPFlows        = 48
 	DefaultMaxUDPFlows        = 64
-	DefaultMaxTotalFlows      = 96
+	DefaultMaxTotalFlows      = 112
 	DefaultHandshakeTimeout   = 10 * time.Second
 	DefaultSessionIdleTimeout = 75 * time.Second
 	DefaultUDPEndpointTimeout = 15 * time.Second
