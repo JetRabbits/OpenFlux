@@ -20,6 +20,11 @@ import (
 	"universal-bypass-tool/utils"
 )
 
+// clientConfigRe extracts the embedded client-config JSON script block from
+// the document HTML. Package-level so the program is built once, not per
+// document fetch.
+var clientConfigRe = regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
+
 type YandexDocsInfo struct {
 	CookieStr   string
 	Token       string
@@ -270,6 +275,27 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	}
 }
 
+// cursorMarker is the JSON key prefix whose value carries the resume cursor.
+const cursorMarker = `"cursor":"`
+
+// extractBase64String pulls the payload out of one inbound doc frame.
+//
+// The cursor branch used to run regexp.MustCompile inside the function, i.e.
+// it recompiled `"cursor":"[^;]+;([^"]+)""` for every inbound frame. A live
+// heap profile taken on iPhone under SpeedTest showed this call at 22.5% of
+// all process allocation churn (25.7 MB in ~35 s): 1.5 MB of actual
+// compilation plus 24.2 MB of RE2 backtracking state (`regexp.(*bitState)`)
+// grown against multi-kilobyte frames. Because the transport runs with
+// GOGC=15, that churn alone drove a GC every few seconds, and every GC
+// clears sync.Pool - which is what forces tun2socks to re-make() its 64 KiB
+// relay buffers for each new session. So this is not just a CPU cost, it is
+// the feedback loop behind the memory plateau.
+//
+// The scan below is allocation-free and byte-for-byte equivalent to the old
+// regex (see TestExtractBase64StringMatchesOldRegex): leftmost `"cursor":"`,
+// then the first `;` at least one byte after the prefix ([^;]+ needs >=1),
+// then capture up to the next quote ([^"]+ needs >=1). A failed candidate
+// moves on to the next occurrence of the marker, like the regex engine does.
 func (t *YandexDocsTransport) extractBase64String(response string) string {
 	if strings.Contains(response, "saveChanges") {
 		marker := `"excelAdditionalInfo":"`
@@ -284,10 +310,27 @@ func (t *YandexDocsTransport) extractBase64String(response string) string {
 		return response[left : left+right]
 	}
 
-	re := regexp.MustCompile(`"cursor":"[^;]+;([^"]+)"`)
-	matches := re.FindStringSubmatch(response)
-	if len(matches) > 1 {
-		return matches[1]
+	for off := 0; off < len(response); {
+		i := strings.Index(response[off:], cursorMarker)
+		if i < 0 {
+			break
+		}
+		start := off + i + len(cursorMarker)
+		off = start
+
+		// [^;]+; - the run before the first ';' must be non-empty.
+		semis := strings.IndexByte(response[start:], ';')
+		if semis <= 0 {
+			continue
+		}
+		value := response[start+semis+1:]
+
+		// ([^"]+) - at least one byte before the closing quote.
+		end := strings.IndexByte(value, '"')
+		if end <= 0 {
+			continue
+		}
+		return value[:end]
 	}
 	return ""
 }
@@ -334,8 +377,9 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		cookies = append(cookies, fmt.Sprintf("%s=%s", c.Name, c.Value))
 	}
 
-	re := regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
-	matches := re.FindStringSubmatch(html)
+	// Compiled once at package level: this runs against the full document
+	// HTML, so compiling per fetch showed up in the iOS alloc-space profile.
+	matches := clientConfigRe.FindStringSubmatch(html)
 	if len(matches) < 2 {
 		return YandexDocsInfo{}, fmt.Errorf("config not found")
 	}

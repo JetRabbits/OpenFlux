@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,6 +47,24 @@ const (
 	fluxPacketFlowInboundQueueCapacity  = 256
 	fluxPacketFlowOutboundQueueCapacity = 256
 )
+
+// init caps the Go heap's soft limit on iOS. This c-archive's Go runtime is
+// the ONLY heap in the NetworkExtension process (Flux client + tun2socks +
+// gVisor stack all live here), and the jetsam budget is ~50 MB of total
+// phys_footprint. Measured on-device 2026-09-16 under stalled multi-flow
+// downloads: with no limit the heap ratchets to ~26.5 MB heapSys and holds it
+// (the scavenger under-releases on iOS), and heapSys + ~20 MB base + the
+// packet-flow backlog crosses the kill line even while the packet paths are
+// behaving. A 16 MB soft limit keeps GC on the heap's tail continuously
+// instead of letting it grow into memory the extension cannot pay for; the
+// live working set during the same trace was ~5 MB, so the limit leaves
+// ~3x headroom for legitimate churn and only taxes CPU via more frequent
+// (millisecond-pause) GCs. Desktop/Android are untouched.
+func init() {
+	if runtime.GOOS == "ios" {
+		debug.SetMemoryLimit(16 << 20)
+	}
+}
 
 type mobileClientState struct {
 	transport transport.Transport
@@ -313,6 +332,30 @@ func StartFluxTun2SocksWithFd(tunFd C.int, socksAddrC *C.char, mtuC C.int) *C.ch
 	return nil
 }
 
+// fluxUDPSessionTimeout is the tun2socks UDP session idle timeout for the
+// Apple packet-flow bridge.
+//
+// tun2socks defaults this to 60s and nothing on the Flux path overrode it, so
+// every UDP session kept its relay buffers parked for a full minute after the
+// app went quiet. A live heap profile taken on iPhone under SpeedTest showed
+// the consequence directly: 46-69% of the entire live Go heap (9.6 MB of
+// 64 KiB blocks at peak) was `tun2socks/v2/buffer` memory held by 144-165
+// goroutines blocked inside tunnel.copyPacketData, which does
+// `buffer.Get(buffer.MaxSegmentSize)` (64 KiB) once per direction and holds it
+// for the whole life of the session. iOS opens one UDP session per
+// destination/ephemeral port, so a SpeedTest burst negotiates ~1.3 sessions
+// per second; occupancy is literally arrivalRate x timeout, and the 60s
+// default priced every one of them at 2 x 64 KiB of pinned heap.
+//
+// 10s undercuts socks5.DefaultUDPEndpointTimeout (15s) on purpose: our own
+// relay already abandons an idle associate at 15s and terminal-reaps any
+// session that is not DNS/53, so a tun2socks session parked past 15s cannot
+// carry traffic any more - it can only hold memory. Recycling it earlier is
+// the same user-visible outcome (the next datagram negotiates a fresh
+// associate) at a fraction of the footprint. TestFluxUDPSessionTimeoutUndercutsRelay
+// guards the invariant against drift.
+const fluxUDPSessionTimeout = 10 * time.Second
+
 // StartFluxTun2SocksPacketFlow starts the Flux TUN<->SOCKS5 bridge backed by
 // packet injection/read exports instead of a raw fd. Use this on iOS, where
 // NetworkExtension exposes NEPacketTunnelFlow rather than a TUN file
@@ -371,6 +414,10 @@ func StartFluxTun2SocksPacketFlow(socksAddrC *C.char, mtuC C.int) *C.char {
 	utils.Debugf("[MOBILE] Flux packet-flow tun2socks start: proxy created")
 
 	handler := t2tunnel.New(proxy, statistic.DefaultManager)
+	// Must happen before the first UDP session is accepted: each session pins
+	// two relay buffers for as long as it stays parked, so the idle timeout is
+	// the memory knob, not a nicety. See fluxUDPSessionTimeout.
+	handler.SetUDPTimeout(fluxUDPSessionTimeout)
 	handler.ProcessAsync()
 	utils.Debugf("[MOBILE] Flux packet-flow tun2socks start: handler ProcessAsync returned")
 
@@ -590,6 +637,11 @@ func StartOpenFluxClient(
 	}
 	if debug != 0 {
 		utils.EnableDebug()
+		// Per-packet dumps inside a NetworkExtension / VpnService process
+		// cause allocation storms that push the footprint past the iOS jetsam
+		// limit (observed NE kill at ~52 MB during SpeedTest with Debug=true).
+		// Keep diagnostics useful while bounding log-driven work.
+		utils.SetDebugRateLimit(25)
 	}
 	utils.Debugf("[MOBILE] OpenFlux client start: entered transport=%s socks=%s", transportType, socksAddr)
 
@@ -739,6 +791,14 @@ func OpenFluxStats() *C.char {
 		"bytesReceived": stats.BytesReceived,
 		"reconnects":    stats.Reconnects,
 		"uptimeSeconds": int64(time.Since(client.startedAt).Seconds()),
+		// Resource observability for the mobile watchdogs (same counters
+		// that made the Cordyceps jetsam debugging tractable).
+		"numGoroutine": runtime.NumGoroutine(),
+	}
+	if client.socks != nil {
+		payload["activeTCPFlows"] = client.socks.ActiveTCPFlows()
+		payload["activeUDPFlows"] = client.socks.ActiveUDPFlows()
+		payload["activeFlows"] = client.socks.ActiveTotalFlows()
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
