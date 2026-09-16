@@ -457,6 +457,34 @@ func (s *SOCKS5Server) releaseFlow(udp bool) {
 	}
 }
 
+// relayBufferSize is the copy chunk of a single relay direction.
+//
+// It used to be 32 KiB, allocated per direction per session with a bare
+// make() - so every TCP session cost 2 x 32 KiB of memory that stayed live as
+// long as the session did, outside any pool. An iPhone on the Ookla SpeedTest
+// app (which opens tens of parallel flows to its :8080 servers) measured this
+// single allocation site at 3.17 MB = 23.7% of the whole live heap, behind only
+// the tun2socks UDP relay buffers. The iOS NetworkExtension budget is ~50 MB
+// phys_footprint and the Go heap is only part of it, so a per-session constant
+// this large is a jetsam driver.
+//
+// 8 KiB is still well above a full-sized packet, so the copy loop stays
+// memcpy-bound; it costs more Read/Write calls at peak throughput, which is the
+// same survival-over-bandwidth trade the iOS stack profile already makes
+// (4 KiB/64 KiB/128 KiB TCP buffers, autotuning off).
+const relayBufferSize = 8 * 1024
+
+// relayBufferPool recycles those chunks. On a NetworkExtension this is a CPU
+// win more than a memory win - the GOMEMLIMIT pressure collections clear
+// sync.Pool constantly (measured 21 GC/s), so do not expect the live set to
+// collapse because of it; the size reduction above is what buys the footprint.
+var relayBufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, relayBufferSize)
+		return &buf
+	},
+}
+
 // relayWithSessionIdle copies src -> dst. The idle window is SHARED by
 // both directions (bump/stalled): a keep-alive session legitimately quiet
 // on one side survives as long as either direction moves bytes, while a
@@ -464,7 +492,9 @@ func (s *SOCKS5Server) releaseFlow(udp bool) {
 // Read deadlines are per-direction guards so the copy loop itself stays
 // responsive to the shared stall signal.
 func relayWithSessionIdle(dst, src net.Conn, timeout time.Duration, bump func(int), stalled func() bool) {
-	buf := make([]byte, 32*1024)
+	bufp := relayBufferPool.Get().(*[]byte)
+	defer relayBufferPool.Put(bufp)
+	buf := *bufp
 	for {
 		_ = src.SetReadDeadline(time.Now().Add(timeout))
 		n, rerr := src.Read(buf)

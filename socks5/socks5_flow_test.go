@@ -2,6 +2,7 @@ package socks5
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -379,4 +380,87 @@ func TestHalfCloseFreesSlotImmediately(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("target-side EOF must free the slot immediately; flow still pinned")
+}
+
+// TestRelayBufferSizedForIOSBudget pins the per-direction copy chunk. The
+// chunk used to be a bare make([]byte, 32*1024) per relay direction, and an
+// iPhone running the Ookla SpeedTest app measured that one allocation site at
+// 3.17 MB - 23.7% of the entire live heap, second only to the tun2socks UDP
+// relay buffers. At the ~50 MB NetworkExtension phys_footprint limit a
+// per-session constant of that size is a jetsam driver, so growing it again is
+// a regression, not a tuning knob.
+func TestRelayBufferSizedForIOSBudget(t *testing.T) {
+	if relayBufferSize > 8*1024 {
+		t.Fatalf("relay chunk is %d bytes; keep it <= 8 KiB (measured 3.17MB / 23.7%% of live heap on iOS at 32 KiB)", relayBufferSize)
+	}
+	chunk := relayBufferPool.Get().(*[]byte)
+	defer relayBufferPool.Put(chunk)
+	if len(*chunk) != relayBufferSize {
+		t.Fatalf("pool hands out %d-byte chunks, want %d", len(*chunk), relayBufferSize)
+	}
+}
+
+// TestRelayMovesAllBytesAndReturns guards the copy loop itself after the chunk
+// shrank: data must arrive intact and byte-for-byte across many chunk
+// boundaries, and the relay must exit once the source is done.
+func TestRelayMovesAllBytesAndReturns(t *testing.T) {
+	const total = 512 * 1024
+
+	relayInRead, relayInWrite := net.Pipe()   // test writes into relayInWrite
+	relayOutRead, relayOutWrite := net.Pipe() // test reads from relayOutRead
+
+	payload := make([]byte, total)
+	for i := range payload {
+		payload[i] = byte(i * 7)
+	}
+
+	var counted atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		relayWithSessionIdle(relayOutWrite, relayInRead, 5*time.Second,
+			func(n int) { counted.Add(int64(n)) },
+			func() bool { return false })
+		close(done)
+	}()
+
+	// net.Pipe is unbuffered and synchronous: the sink must be drained
+	// concurrently or the relay blocks in Write and dies on its read deadline.
+	gotCh := make(chan []byte, 1)
+	go func() {
+		got, _ := io.ReadAll(relayOutRead)
+		gotCh <- got
+	}()
+
+	go func() {
+		sent := 0
+		for sent < total {
+			n, err := relayInWrite.Write(payload[sent:])
+			if n <= 0 {
+				break
+			}
+			sent += n
+			if err != nil {
+				break
+			}
+		}
+		relayInWrite.Close()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("relay did not return after the source was closed")
+	}
+	relayOutWrite.Close()
+
+	got := <-gotCh
+	if len(got) != total {
+		t.Fatalf("relayed %d of %d bytes", len(got), total)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("relay corrupted the stream")
+	}
+	if counted.Load() != int64(total) {
+		t.Fatalf("idle bump counted %d bytes, want %d", counted.Load(), total)
+	}
 }
