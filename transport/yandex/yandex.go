@@ -25,6 +25,31 @@ import (
 // document fetch.
 var clientConfigRe = regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
 
+// Deadline tuning for the document WebSocket.
+//
+// Without a write deadline, gorilla WriteMessage blocks forever once the
+// server (or an intermediate LB) stops draining the socket: TCP retransmits
+// into a blackhole while the write buffer fills. The single writerLoop then
+// freezes ON THE OLD CONNECTION while the read loop happily reconnects a new
+// one, so the WriteQueue piles up behind a writer that can never return -
+// the transport looks CONNECTED and downloads keep flowing, but every uplink
+// session stalls until its virtual-TCP retransmit budget runs out and the
+// app gets a connection reset. That is the "SpeedTest never reaches upload"
+// failure mode measured on iOS on 2026-09-16 (uplink RST ~75-100 s into a
+// sustained upload, downlink unaffected).
+//
+// The write deadline bounds the worst case; hitting it kills the connection
+// (see DocSession.kill) so the read loop observes the error and the normal
+// reconnect path rebuilds a usable session. The read deadline catches the
+// symmetric blackhole for the reader: our own 10 s keep-alive is echoed back
+// by the document server, so a healthy link always produces inbound bytes
+// well inside the window; silence past the deadline means the link is dead.
+// Package-level vars so unit tests can shrink them.
+var (
+	ydocWriteDeadline = 10 * time.Second
+	ydocReadDeadline  = 75 * time.Second
+)
+
 type YandexDocsInfo struct {
 	CookieStr   string
 	Token       string
@@ -46,20 +71,51 @@ type DocSession struct {
 	writeMu    sync.Mutex
 }
 
+// kill force-closes the session socket. Idempotent and safe to call from any
+// goroutine: websocket.Conn.Close is goroutine-safe and unblocks both the
+// stalled writer and the blocked reader, which turns any half-dead link into
+// an ordinary read-loop error and therefore an ordinary reconnect.
+func (s *DocSession) kill() {
+	if s.Conn != nil {
+		_ = s.Conn.Close()
+	}
+}
+
+// safeWrite writes one frame under the session write mutex, bounded by
+// ydocWriteDeadline. Any failure (deadline, broken pipe, closing race) kills
+// the connection so the reconnect machinery takes over instead of leaving a
+// permanently stuck writer behind.
 func (s *DocSession) safeWrite(messageType int, data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return s.Conn.WriteMessage(messageType, data)
+	if s.Conn == nil {
+		return fmt.Errorf("session has no connection")
+	}
+	if err := s.Conn.SetWriteDeadline(time.Now().Add(ydocWriteDeadline)); err != nil {
+		s.kill()
+		return err
+	}
+	if err := s.Conn.WriteMessage(messageType, data); err != nil {
+		s.kill()
+		return err
+	}
+	return nil
 }
 
 type YandexDocsTransport struct {
 	*transport.BaseTransport
 
-	url      string
-	session  *DocSession
+	url     string
+	session *DocSession
 
 	userCounter atomic.Int32
 	baseUserID  string
+
+	// sendDrops counts uplink frames dropped because the WS writer could not
+	// keep up. Logged periodically so a queue-full collapse (sustained
+	// uplink >> carrier capacity) is visible in stats instead of being pure
+	// silent retransmission loss inside the virtual TCP stack.
+	sendDrops atomic.Uint64
 }
 
 func NewYandexDocsTransport(url string, config transport.TransportConfig) *YandexDocsTransport {
@@ -101,6 +157,11 @@ func (t *YandexDocsTransport) Send(data []byte) error {
 		t.RecordSend(len(data))
 		return nil
 	default:
+		// Uplink offered load exceeds carrier write capacity: drop the frame
+		// (the virtual TCP stack retransmits) but make the condition loud.
+		if d := t.sendDrops.Add(1); d == 1 || d%100 == 0 {
+			utils.Debugf("[YDOCS] uplink write queue full, dropped %d frame(s) so far", d)
+		}
 		return fmt.Errorf("write queue full")
 	}
 }
@@ -183,9 +244,14 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart))))
 
 		for t.IsRunning() {
+			if err := conn.SetReadDeadline(time.Now().Add(ydocReadDeadline)); err != nil {
+				utils.Debugf("[YDOCS] SetReadDeadline failed: %v", err)
+				break
+			}
 			_, message, err := conn.ReadMessage()
 			if err != nil {
 				utils.Debugf("[YDOCS] Read error: %v", err)
+				session.kill()
 				t.SetConnected(false)
 				t.scheduleReconnect(attempt)
 				return
@@ -358,7 +424,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		Timeout:       30 * time.Second,
 	}
 
-		req, _ := http.NewRequest("GET", url, nil)
+	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	utils.Debugf("[YDOCS] Fetching document URL: %s", url)
 	resp, err := client.Do(req)
