@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/url"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,6 +47,24 @@ const (
 	fluxPacketFlowInboundQueueCapacity  = 256
 	fluxPacketFlowOutboundQueueCapacity = 256
 )
+
+// init caps the Go heap's soft limit on iOS. This c-archive's Go runtime is
+// the ONLY heap in the NetworkExtension process (Flux client + tun2socks +
+// gVisor stack all live here), and the jetsam budget is ~50 MB of total
+// phys_footprint. Measured on-device 2026-09-16 under stalled multi-flow
+// downloads: with no limit the heap ratchets to ~26.5 MB heapSys and holds it
+// (the scavenger under-releases on iOS), and heapSys + ~20 MB base + the
+// packet-flow backlog crosses the kill line even while the packet paths are
+// behaving. A 16 MB soft limit keeps GC on the heap's tail continuously
+// instead of letting it grow into memory the extension cannot pay for; the
+// live working set during the same trace was ~5 MB, so the limit leaves
+// ~3x headroom for legitimate churn and only taxes CPU via more frequent
+// (millisecond-pause) GCs. Desktop/Android are untouched.
+func init() {
+	if runtime.GOOS == "ios" {
+		debug.SetMemoryLimit(16 << 20)
+	}
+}
 
 type mobileClientState struct {
 	transport transport.Transport
