@@ -15,7 +15,8 @@ var (
 	useICEInjection = true
 )
 
-func (h *CallHandler) SetOnConnected(cb func()) { h.onConnected = cb }
+func (h *CallHandler) SetOnConnected(cb func())     { h.onConnected = cb }
+func (h *CallHandler) SetDCInbound(cb func([]byte)) { h.dcInbound = cb }
 
 func (h *CallHandler) Send(data []byte) {
 	if useICEInjection {
@@ -27,13 +28,18 @@ func (h *CallHandler) Send(data []byte) {
 	}
 }
 
-func (h *CallHandler) readLoop(callback func()) {
+func (h *CallHandler) readLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			logError("recovered in CallHandler.readLoop: %v", r)
+		}
+	}()
 	logInfo("[%s] Signaling connected", h.tag)
-	defer callback()
 	for {
 		_, message, err := h.conn.ReadMessage()
 		if err != nil {
 			logError("[%s] Signaling disconnected: %v", h.tag, err)
+			h.signalReconnect()
 			return
 		}
 		text := string(message)
@@ -46,7 +52,9 @@ func (h *CallHandler) readLoop(callback func()) {
 
 		if text == "ping" {
 			h.mu.Lock()
-			h.conn.WriteMessage(websocket.TextMessage, []byte("pong"))
+			if h.conn != nil {
+				h.conn.WriteMessage(websocket.TextMessage, []byte("pong"))
+			}
 			h.mu.Unlock()
 			continue
 		}
@@ -72,15 +80,36 @@ func (h *CallHandler) readLoop(callback func()) {
 	}
 }
 
+func (h *CallHandler) signalReconnect() {
+	if h.role == "caller" {
+		select {
+		case h.reconnectCh <- struct{}{}:
+		default:
+		}
+	} else {
+		// Never kill the host process (this code runs inside the iOS/Android
+		// app as a library); just signal the reconnect channel and let the
+		// transport's reconnect logic handle it.
+		logError("[%s] Receiver connection died, signaling reconnect", h.tag)
+		select {
+		case h.reconnectCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
 func (h *CallHandler) sendAcceptCall() {
 	if h.acceptSent {
 		return
 	}
 	h.acceptSent = true
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.conn == nil {
+		return
+	}
 	msg := fmt.Sprintf(`{"command":"accept-call","sequence":%d,"mediaSettings":{"isAudioEnabled":true,"isVideoEnabled":false,"isScreenSharingEnabled":false,"isFastScreenSharingEnabled":false,"isAudioSharingEnabled":false,"isAnimojiEnabled":false}}`, h.seq)
 	h.seq++
-	h.mu.Unlock()
 	h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
 	logInfo("[%s] Accept-call sent", h.tag)
 }
@@ -170,11 +199,10 @@ func (h *CallHandler) createPeerConnection(convParams map[string]interface{}) {
 		return
 	}
 	h.dc = dc
-	dcID := uint16(0)
-	if dc.ID() != nil {
-		dcID = *dc.ID()
-	}
-	logInfo("[%s] DataChannel: label=%s id=%d", h.tag, dc.Label(), dcID)
+	//_ := uint16(0)
+	//if dc.ID() != nil {
+	//	dcID = *dc.ID()
+	//}
 	dc.OnOpen(func() { logInfo("[%s] DC opened", h.tag) })
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		h.dcInbound(msg.Data)
@@ -184,17 +212,24 @@ func (h *CallHandler) createPeerConnection(convParams map[string]interface{}) {
 func (h *CallHandler) sendSDP(sdp string, sdpType string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.conn == nil {
+		return
+	}
 	escaped, _ := json.Marshal(sdp)
 	msg := fmt.Sprintf(`{"command":"transmit-data","sequence":%d,"participantId":%d,"data":{"sdp":{"type":"%s","sdp":%s},"animojiVersion":1},"participantType":"USER"}`,
 		h.seq, h.localID, sdpType, string(escaped))
 	h.seq++
 	logInfo("[%s] Sent SDP %s (%d bytes)", h.tag, sdpType, len(sdp))
-	h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
+	fmt.Println(msg)
+	//h.conn.WriteMessage(websocket.TextMessage, []byte(msg))
 }
 
 func (h *CallHandler) injectICE(payload []byte) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.conn == nil {
+		return
+	}
 	type ice struct {
 		Candidate string `json:"candidate"`
 	}
@@ -210,9 +245,11 @@ func (h *CallHandler) sendICE(candidateJSON string) {
 	if useICEInjection {
 		return
 	}
-
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.conn == nil {
+		return
+	}
 	var ice struct {
 		Candidate string `json:"candidate"`
 	}
@@ -286,7 +323,7 @@ func (h *CallHandler) handleSDP(sdpType string, sdpStr string) {
 			logError("[%s] ERROR: %v", h.tag, err)
 			return
 		}
-		h.pc.SetLocalDescription(answer)
+		//h.pc.SetLocalDescription(answer)
 		h.sendSDP(answer.SDP, "answer")
 
 	case "answer":
@@ -303,8 +340,9 @@ func (h *CallHandler) handleSDP(sdpType string, sdpStr string) {
 }
 
 func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
-	h := &CallHandler{tag: "CALLER"}
+	h := &CallHandler{tag: "CALLER", role: "caller"}
 	h.seq = 1
+	h.reconnectCh = make(chan struct{}, 1)
 	h.msgHandler = func(text string) {
 		var data map[string]interface{}
 		json.Unmarshal([]byte(text), &data)
@@ -335,7 +373,7 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 			for {
 				time.Sleep(1 * time.Second)
 				fmt.Println("waiting for accept ...")
-				if h.callAccepted {
+				if h.callAccepted || useICEInjection {
 					break
 				}
 			}
@@ -346,7 +384,7 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 				logError("[%s] ERROR: %v", h.tag, err)
 				return
 			}
-			h.pc.SetLocalDescription(offer)
+			//h.pc.SetLocalDescription(offer)
 			h.sendSDP(offer.SDP, "offer")
 			return
 		}
@@ -357,6 +395,9 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 		if sdp, ok := d["sdp"].(map[string]interface{}); ok {
 			sdpType, _ := sdp["type"].(string)
 			if sdpType == "answer" {
+				if useICEInjection {
+					return
+				}
 				h.handleSDP(sdpType, sdp["sdp"].(string))
 			}
 			return
@@ -373,34 +414,59 @@ func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
 	}
 
 	logInfo("[CALLER] Calling %d", calleeID)
-	resp, _ := client.invoke(78, map[string]interface{}{
-		"conversationId": genUUID(),
-		"calleeIds":      []int64{calleeID},
-		"internalParams": fmt.Sprintf(`{"deviceId":"%s","sdkVersion":"2.8.9","clientAppKey":"CNHIJPLGDIHBABABA","platform":"WEB","protocolVersion":5,"domainId":"","capabilities":"2A03F"}`, client.deviceID),
-		"isVideo":        false,
-	})
-	var payload map[string]interface{}
-	json.Unmarshal(resp.Payload, &payload)
-	paramsStr, _ := payload["internalCallerParams"].(string)
-	var params InternalCallerParams
-	json.Unmarshal([]byte(paramsStr), &params)
 
-	endpoint := params.Endpoint + "&platform=WEB&appVersion=1.1&version=5&device=browser&capabilities=2A03F&clientType=ONE_ME&tgt=start"
-	conn, _, _ := websocket.DefaultDialer.Dial(endpoint, nil)
-	h.conn = conn
-	go h.readLoop(func() {
-		if !useICEInjection {
-			return
+	// Connect with auto-reconnect loop
+	go func() {
+		for {
+			h.mu.Lock()
+			h.callAccepted = false
+			h.acceptSent = false
+			h.hasRemoteDesc = false
+			h.pendingCandidates = nil
+			h.seq = 1
+			if h.pc != nil {
+				h.pc.Close()
+				h.pc = nil
+			}
+			h.dc = nil
+			h.mu.Unlock()
+
+			resp, _ := client.invoke(78, map[string]interface{}{
+				"conversationId": genUUID(),
+				"calleeIds":      []int64{calleeID},
+				"internalParams": fmt.Sprintf(`{"deviceId":"%s","sdkVersion":"2.8.9","clientAppKey":"CNHIJPLGDIHBABABA","platform":"WEB","protocolVersion":5,"domainId":"","capabilities":"2A03F"}`, client.deviceID),
+				"isVideo":        false,
+			})
+			var payload map[string]interface{}
+			json.Unmarshal(resp.Payload, &payload)
+			paramsStr, _ := payload["internalCallerParams"].(string)
+			var params InternalCallerParams
+			json.Unmarshal([]byte(paramsStr), &params)
+
+			endpoint := params.Endpoint + "&platform=WEB&appVersion=1.1&version=5&device=browser&capabilities=2A03F&clientType=ONE_ME&tgt=start"
+			conn, _, err := websocket.DefaultDialer.Dial(endpoint, nil)
+			if err != nil {
+				logError("[CALLER] Dial error: %v, retrying...", err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			h.mu.Lock()
+			h.conn = conn
+			h.mu.Unlock()
+			go h.readLoop()
+
+			// Wait for disconnect signal
+			<-h.reconnectCh
+			logInfo("[CALLER] Reconnecting in 1s...")
+			time.Sleep(1 * time.Second)
 		}
+	}()
 
-		fmt.Println("Signalling is dead, calling again bc of injectICE turned on")
-		startOutgoingCall(client, calleeID)
-	})
 	return h
 }
 
 func startIncomingListener(client *MaxClient) *CallHandler {
-	h := &CallHandler{tag: "RECEIVER"}
+	h := &CallHandler{tag: "RECEIVER", role: "receiver"}
 	h.seq = 1
 	h.msgHandler = func(text string) {
 		var data map[string]interface{}
@@ -440,7 +506,6 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 			return
 		}
 		if c, ok := d["candidate"].(map[string]interface{}); ok {
-
 			if useICEInjection {
 				candidateStr, _ := c["candidate"].(string)
 				decode, _ := base64.StdEncoding.DecodeString(candidateStr)
@@ -472,16 +537,10 @@ func startIncomingListener(client *MaxClient) *CallHandler {
 				logError("[RECEIVER] Connect error: %v", err)
 				return
 			}
+			h.mu.Lock()
 			h.conn = conn
-			go h.readLoop(func() {
-				if !useICEInjection {
-					return
-				}
-
-				fmt.Println("Signalling is dead. " +
-					"Gonna kill myself now")
-			})
-			// accept-call will be sent after reconnection (in readLoop) or after timeout
+			h.mu.Unlock()
+			go h.readLoop()
 			go func() {
 				time.Sleep(1 * time.Second)
 				if !h.acceptSent {

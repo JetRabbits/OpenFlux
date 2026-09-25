@@ -57,10 +57,17 @@ func (c *blockingConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *blockingConn) SetWriteDeadline(time.Time) error { return nil }
 
 type fakeDialer struct {
-	fn func(address string) (net.Conn, error)
+	fn    func(address string) (net.Conn, error)
+	udpFn func(address string) (net.Conn, error)
 }
 
 func (d *fakeDialer) DialTCP(address string) (net.Conn, error) { return d.fn(address) }
+func (d *fakeDialer) DialUDP(address string) (net.Conn, error) {
+	if d.udpFn != nil {
+		return d.udpFn(address)
+	}
+	return d.fn(address)
+}
 
 func startTestServer(t *testing.T, dialer Dialer, configure func(*SOCKS5Server)) (*SOCKS5Server, string) {
 	t.Helper()
@@ -278,11 +285,9 @@ func TestUDPAssociateReapedWhenIdle(t *testing.T) {
 	}
 }
 
-func TestUDPAssociateReapedOnNonDNSPort(t *testing.T) {
+func TestUDPAssociateSlotFreedWhenControlCloses(t *testing.T) {
 	dialer := &fakeDialer{fn: func(string) (net.Conn, error) { return newBlockingConn(), nil }}
 	server, addr := startTestServer(t, dialer, func(s *SOCKS5Server) {
-		// Long endpoint timeout: only the terminal classification may
-		// reap this associate, not idleness.
 		s.SetFlowLimits(0, 0, 0, 0, 0, 30*time.Second, 0, 0)
 	})
 
@@ -319,10 +324,7 @@ func TestUDPAssociateReapedOnNonDNSPort(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	if n, err := conn.Read(make([]byte, 1)); err == nil && n > 0 {
-		t.Fatalf("non-DNS associate was not reaped, read %d bytes", n)
-	}
+	_ = conn.Close()
 	deadline := time.Now().Add(2 * time.Second)
 	for server.ActiveUDPFlows() != 0 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)

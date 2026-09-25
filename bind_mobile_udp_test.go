@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"universal-bypass-tool/socks5"
+	"openflux/socks5"
 )
 
 // TestFluxUDPSessionTimeoutUndercutsRelay locks the layering invariant that
