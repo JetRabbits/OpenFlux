@@ -47,23 +47,29 @@ var (
 	// the docs WebSocket handshake before Chrome emulation was introduced.
 	legacyWSUserAgent = "Mozilla/5.0"
 
-	// wsChromeLike guards the Chrome-like (utls + Chrome UA) docs WebSocket
-	// handshake. The standalone server needs it to survive SmartCaptcha on
-	// datacenter IPs; embedded clients dial the docs WebSocket plain with a
-	// legacy UA. See SetWSChromeLike.
-	wsChromeLike = true
+	// legacyFetchUserAgent is the exact User-Agent the mobile clients sent
+	// on the docs redirect-hop GETs before Chrome emulation was introduced.
+	legacyFetchUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
+
+	// chromeLike gates all Chrome-like (utls + Chrome UA) fingerprints on
+	// the Yandex Docs access path: redirect-hop GETs, captcha solving and
+	// the WebSocket handshake. The standalone server needs it to survive
+	// SmartCaptcha on datacenter IPs; embedded clients use the plain
+	// net/http + WebSocket path they were validated with. See SetChromeLike.
+	chromeLike = true
 )
 
-// SetWSChromeLike toggles Chrome-like TLS (utls) and User-Agent on the
-// Yandex Docs WebSocket handshake. Defaults to true (standalone server
-// behavior). Embedded/mobile binaries should call this with false during
-// initialization: rendezvous over a plain TLS WebSocket is what mobile
-// deployments are validated against. It has no effect on the HTTP
-// redirect-hop client, which always uses the Chrome-like helper.
-func SetWSChromeLike(enabled bool) { wsChromeLike = enabled }
+// SetChromeLike toggles Chrome-like TLS (utls) and browser headers for the
+// whole Yandex Docs access path (redirect-hop GETs, captcha solving, and the
+// WebSocket handshake). Defaults to true (standalone server behavior).
+// Embedded/mobile binaries should call this with false during initialization:
+// plain net/http rendezvous is what mobile deployments are validated against,
+// and Chrome emulation from residential IPs can trigger SmartCaptcha or
+// handshake paths the mobile stack never exercised.
+func SetChromeLike(enabled bool) { chromeLike = enabled }
 
 // newDocWSDialer builds the Yandex Docs WebSocket dialer honoring
-// wsChromeLike. The hard TCP dial timeout keeps a stuck connect/DNS to the
+// chromeLike. The hard TCP dial timeout keeps a stuck connect/DNS to the
 // balancer host from hanging the whole transport (HandshakeTimeout alone
 // proved insufficient on iOS).
 func newDocWSDialer() websocket.Dialer {
@@ -74,18 +80,56 @@ func newDocWSDialer() websocket.Dialer {
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 	}
-	if wsChromeLike {
+	if chromeLike {
 		d.NetDialTLSContext = chromeLikeDialTLSContext
 	}
 	return d
 }
 
-// docWSUserAgent returns the handshake User-Agent matching wsChromeLike.
+// docWSUserAgent returns the handshake User-Agent matching chromeLike.
 func docWSUserAgent() string {
-	if wsChromeLike {
+	if chromeLike {
 		return chromeUserAgent
 	}
 	return legacyWSUserAgent
+}
+
+// docHTTPClient builds the redirect-hop HTTP client honoring chromeLike.
+// Disabled mode is the bare net/http client the mobile runtime shipped with
+// (system TLS, no custom transport).
+func docHTTPClient(jar http.CookieJar, timeout time.Duration) *http.Client {
+	if chromeLike {
+		return chromeLikeHTTPClient(jar, timeout)
+	}
+	return &http.Client{
+		Jar:     jar,
+		Timeout: timeout,
+	}
+}
+
+// docFetchUserAgent returns the redirect-hop User-Agent matching chromeLike.
+func docFetchUserAgent() string {
+	if chromeLike {
+		return chromeUserAgent
+	}
+	return legacyFetchUserAgent
+}
+
+// setFetchHeaders applies request headers for an explicit userAgent honoring
+// chromeLike. Disabled mode sends only the User-Agent, exactly as the
+// pre-emulation mobile path did.
+func setFetchHeaders(req *http.Request, userAgent string) {
+	if chromeLike {
+		setChromeLikeHeaders(req, userAgent)
+		return
+	}
+	req.Header.Set("User-Agent", userAgent)
+}
+
+// setDocFetchHeaders applies the redirect-hop request headers honoring
+// chromeLike.
+func setDocFetchHeaders(req *http.Request) {
+	setFetchHeaders(req, docFetchUserAgent())
 }
 
 type YandexDocsInfo struct {
@@ -607,13 +651,13 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		}
 	}
 
-	client := chromeLikeHTTPClient(jar, 15*time.Second)
+	client := docHTTPClient(jar, 15*time.Second)
 	// НЕ следуем редиректам автоматически — обрабатываем вручную.
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
 
-	ua := chromeUserAgent
+	ua := docFetchUserAgent()
 
 	// Явно следуем по редиректам: до 10 хопов.
 	currentURL := url
@@ -625,7 +669,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		utils.Debugf("[YDOCS] hop %d: GET %s", hop, shortStr(currentURL, 120))
 
 		req, _ := http.NewRequest("GET", currentURL, nil)
-		setChromeLikeHeaders(req, ua)
+		setDocFetchHeaders(req)
 		resp, err = client.Do(req)
 		if err != nil {
 			return YandexDocsInfo{}, fmt.Errorf("GET %s: %w", currentURL, err)

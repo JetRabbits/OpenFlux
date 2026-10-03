@@ -31,10 +31,10 @@ func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, 
 		return "", fmt.Errorf("captcha: nil cookiejar")
 	}
 	if userAgent == "" {
-		userAgent = chromeUserAgent
+		userAgent = docFetchUserAgent()
 	}
 
-	client := chromeLikeHTTPClient(jar, 30*time.Second)
+	client := docHTTPClient(jar, 30*time.Second)
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
@@ -320,7 +320,7 @@ func encodeCaptchaFingerprint(fp map[string]interface{}) string {
 // ---- helpers ----
 
 func setBrowserHeaders(req *http.Request, userAgent string) {
-	setChromeLikeHeaders(req, userAgent)
+	setFetchHeaders(req, userAgent)
 }
 
 func hexEncode(b []byte) string {
