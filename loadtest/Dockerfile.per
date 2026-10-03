@@ -1,0 +1,12 @@
+FROM python:3.12-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir playwright==1.48.0 \
+ && python -m playwright install --with-deps chromium \
+ && rm -rf /root/.cache/ms-playwright/chromium-*/chrome-linux/test-runner \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+COPY openflux /usr/local/bin/openflux
+COPY container_mint.py /mint.py
+COPY entry_per.sh /entry.sh
+RUN chmod +x /entry.sh && mkdir -p /data
+ENTRYPOINT ["/entry.sh"]
