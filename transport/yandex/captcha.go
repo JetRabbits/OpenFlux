@@ -22,6 +22,8 @@ import (
 //
 // Возвращает retpath (пустая строка = капча не требовалась).
 // Cookies в jar обновляются на месте.
+var solveCaptchaFn = solveCaptcha
+
 func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, error) {
 	if jar == nil {
 		return "", fmt.Errorf("captcha: nil cookiejar")

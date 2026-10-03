@@ -586,6 +586,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	currentURL := url
 	var resp *http.Response
 	var err error
+	captchaSolved := false
 
 	for hop := 0; hop < 10; hop++ {
 		utils.Debugf("[YDOCS] hop %d: GET %s", hop, shortStr(currentURL, 120))
@@ -623,15 +624,26 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 				return YandexDocsInfo{}, ErrCaptchaRequired
 			}
 
-			// First-tier captcha (PoW, showcaptchafast). Solve and retry
-			// the original url.
+			// First-tier captcha (PoW, showcaptchafast). Solve once and
+			// continue from the returned retpath when Yandex provides one.
 			if strings.Contains(loc, "showcaptchafast") {
+				if captchaSolved {
+					utils.Debugf("[YDOCS] repeated PoW captcha at %s; external solver required", safeDocURL(currentURL))
+					return YandexDocsInfo{}, ErrCaptchaRequired
+				}
 				utils.Debugf("[YDOCS] captcha detected, solving...")
-				if _, cerr := solveCaptcha(currentURL, jar, ua); cerr != nil {
+				retpath, cerr := solveCaptchaFn(currentURL, jar, ua)
+				if cerr != nil {
 					return YandexDocsInfo{}, fmt.Errorf("captcha solve: %w", cerr)
 				}
-				utils.Debugf("[YDOCS] captcha solved, retrying original url")
-				currentURL = url
+				captchaSolved = true
+				if retpath != "" {
+					utils.Debugf("[YDOCS] captcha solved, continuing from retpath host %s", safeDocURL(retpath))
+					currentURL = retpath
+				} else {
+					utils.Debugf("[YDOCS] captcha solved without retpath, retrying original host %s", safeDocURL(url))
+					currentURL = url
+				}
 				continue
 			}
 

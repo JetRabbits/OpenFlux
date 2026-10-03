@@ -158,6 +158,7 @@ func authorizeWithJar(docURL string, jar http.CookieJar) (*volgaAuth, error) {
 	var finalBody []byte
 	var finalURL string
 	currentURL := docURL
+	captchaSolved := false
 
 	for i := 0; i < 15; i++ {
 		req, _ := http.NewRequest("GET", currentURL, nil)
@@ -200,12 +201,23 @@ func authorizeWithJar(docURL string, jar http.CookieJar) (*volgaAuth, error) {
 			}
 
 			if strings.Contains(loc, "showcaptchafast") {
+				if captchaSolved {
+					utils.Debugf("[VOLGA] repeated PoW captcha at %s; external solver required", safeDocURL(currentURL))
+					return nil, ErrCaptchaRequired
+				}
 				utils.Debugf("[VOLGA] captcha required, solving...")
-				if _, cerr := solveCaptcha(docURL, jar, volgaUserAgent); cerr != nil {
+				retpath, cerr := solveCaptchaFn(docURL, jar, volgaUserAgent)
+				if cerr != nil {
 					return nil, fmt.Errorf("captcha solve: %w", cerr)
 				}
-				utils.Debugf("[VOLGA] captcha solved, retrying from %s", docURL)
-				currentURL = docURL
+				captchaSolved = true
+				if retpath != "" {
+					utils.Debugf("[VOLGA] captcha solved, continuing from retpath host %s", safeDocURL(retpath))
+					currentURL = retpath
+				} else {
+					utils.Debugf("[VOLGA] captcha solved without retpath, retrying original host %s", safeDocURL(docURL))
+					currentURL = docURL
+				}
 				continue
 			}
 
