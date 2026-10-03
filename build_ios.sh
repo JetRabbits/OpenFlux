@@ -48,8 +48,7 @@ if go build \
     
     # go build -buildmode=c-archive auto-generates $OUTPUT_DIR/$LIBRARY_NAME.h
     # next to the .a from the //export comments in bind_mobile.go — no manual
-    # header stub needed (a previous placeholder here referenced a stale
-    # RunMain/RunMainClient/RunMainExitNode API that no longer exists).
+    # header stub needed.
     echo "Build complete: $OUTPUT_DIR/$LIBRARY_NAME.a"
     ls -lh "$OUTPUT_DIR/$LIBRARY_NAME.a"
     

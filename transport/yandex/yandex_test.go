@@ -1,117 +1,145 @@
 package yandex
 
 import (
-	"math/rand"
-	"regexp"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
 
-// oldCursorRe is the regex that extractBase64String used before the
-// allocation-free rewrite. It is kept here purely as the equivalence oracle:
-// the rewrite must return exactly what this engine returns for every input.
-var oldCursorRe = regexp.MustCompile(`"cursor":"[^;]+;([^"]+)"`)
-
-func oldExtractBase64String(response string) string {
-	if strings.Contains(response, "saveChanges") {
-		marker := `"excelAdditionalInfo":"`
-		left := strings.Index(response, marker) + len(marker)
-		if left < len(marker) {
-			return ""
-		}
-		right := strings.Index(response[left:], `"`)
-		if right == -1 {
-			return ""
-		}
-		return response[left : left+right]
-	}
-	matches := oldCursorRe.FindStringSubmatch(response)
-	if len(matches) > 1 {
-		return matches[1]
-	}
-	return ""
+func clientConfigPage(config string) string {
+	return `<!DOCTYPE html><html><head><script id="client-config" type="application/json">` +
+		config + `</script></head><body></body></html>`
 }
 
-func TestExtractBase64String(t *testing.T) {
-	cases := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{"typical cursor", `{"cursor":"AAAA;X123abc;def"}`, "X123abc;def"},
-		{"single segment cursor", `{"cursor":"tok;payload123"}`, "payload123"},
-		{"no semicolon", `{"cursor":"nopayload"}`, ""},
-		{"empty before semicolon", `{"cursor":";payload"}`, ""},
-		{"empty after semicolon", `{"cursor":"tok;"}`, ""},
-		{"no closing quote", `{"cursor":"tok;payload`, ""},
-		{"no marker", `{"other":"tok;payload"}`, ""},
-		{"empty", "", ""},
-		{"second occurrence wins when first is unusable",
-			`{"cursor":";bad"} {"cursor":"ok;good"}`, "good"},
-		{"quote inside pre-semicolon run is allowed",
-			`{"cursor":"a"b;c"}`, "c"},
-		{"cursor after unrelated text",
-			`prefix junk {"cursor":"p1;SECRET_9"}`, "SECRET_9"},
-		{"saveChanges branch takes precedence",
-			`saveChanges {"cursor":"p1;fromCursor"} "excelAdditionalInfo":"fromExtra"`,
-			"fromExtra"},
-		{"saveChanges without additional info marker",
-			`saveChanges {"cursor":"p1;fromCursor"}`, ""},
-	}
+func serveConfig(t *testing.T, body string) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
 
-	tpt := &YandexDocsTransport{}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tpt.extractBase64String(tc.input); got != tc.want {
-				t.Fatalf("extractBase64String(%q) = %q, want %q", tc.input, got, tc.want)
-			}
-			// The table itself must agree with the legacy engine too,
-			// otherwise the expectations drifted from real behaviour.
-			if legacy := oldExtractBase64String(tc.input); legacy != tc.want {
-				t.Fatalf("table disagrees with legacy regex on %q: legacy=%q want=%q",
-					tc.input, legacy, tc.want)
-			}
-		})
+// A "volga" client-config carries no balancer_url; the request must fail with an
+// error instead of panicking.
+func TestFetchDocInfoVolgaConfigReturnsError(t *testing.T) {
+	config := `{"officeActionData":{"officeType":"volga","editor_config":{"type":"desktop",` +
+		`"document":{"key":"volgaDocKey","fileType":"docx","url":"http://localhost:12701/disk/x",` +
+		`"title":"x.docx"},"token":"volga-jwt"}}}`
+
+	url := serveConfig(t, clientConfigPage(config))
+
+	info, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001")
+	if err == nil {
+		t.Fatalf("expected an error for a config without balancer_url, got info %+v", info)
+	}
+	if !strings.Contains(err.Error(), "balancer_url") {
+		t.Errorf("error should name the missing field, got: %v", err)
 	}
 }
 
-// TestExtractBase64StringMatchesOldRegex differentially fuzzes the rewrite
-// against the regex oracle over inputs drawn from an alphabet that actually
-// exercises the grammar (marker bytes, quotes, semicolons).
-func TestExtractBase64StringMatchesOldRegex(t *testing.T) {
-	alphabet := []string{
-		`"cursor":"`, `"`, `;`, `x`, `;`, `"`, ` `, `cursor`, `:`, `saveChanges`,
-		`"excelAdditionalInfo":"`, "\n",
-	}
-	rng := rand.New(rand.NewSource(1))
+func TestFetchDocInfoMissingOfficeActionDataReturnsError(t *testing.T) {
+	url := serveConfig(t, clientConfigPage(`{"somethingElse":true}`))
 
-	tpt := &YandexDocsTransport{}
-	for i := 0; i < 200000; i++ {
-		var b strings.Builder
-		for n := rng.Intn(12); n >= 0; n-- {
-			b.WriteString(alphabet[rng.Intn(len(alphabet))])
-		}
-		input := b.String()
-		got := tpt.extractBase64String(input)
-		want := oldExtractBase64String(input)
-		if got != want {
-			t.Fatalf("mismatch on %q: new=%q legacy=%q", input, got, want)
-		}
+	if _, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001"); err == nil {
+		t.Fatal("expected an error when officeActionData is absent")
 	}
 }
 
-// BenchmarkExtractBase64String guards the hot path: this function runs per
-// inbound doc frame, and the regex version cost ~24 MB of allocations per
-// ~35 s of SpeedTest traffic on iPhone. Allocations per op must stay zero.
-func BenchmarkExtractBase64String(b *testing.B) {
-	frame := `{"a":".....` + strings.Repeat("z", 2048) +
-		`....","cursor":"AAAA;BBBBCCCC;DDDD","b":"end"}`
-	tpt := &YandexDocsTransport{}
+func TestFetchDocInfoMissingDocumentReturnsError(t *testing.T) {
+	config := `{"officeActionData":{"balancer_url":"https://balancer.example.net",` +
+		`"editor_config":{"type":"desktop","token":"jwt"}}}`
 
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		if tpt.extractBase64String(frame) != "BBBBCCCC;DDDD" {
-			b.Fatal("unexpected result")
-		}
+	url := serveConfig(t, clientConfigPage(config))
+
+	if _, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001"); err == nil {
+		t.Fatal("expected an error when editor_config.document is absent")
+	}
+}
+
+func TestFetchDocInfoMissingTokenReturnsError(t *testing.T) {
+	config := `{"officeActionData":{"balancer_url":"https://balancer.example.net",` +
+		`"editor_config":{"type":"desktop","document":{"key":"docKey"}}}}`
+
+	url := serveConfig(t, clientConfigPage(config))
+
+	if _, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001"); err == nil {
+		t.Fatal("expected an error when editor_config.token is absent")
+	}
+}
+
+func TestFetchDocInfoInvalidJSONReturnsError(t *testing.T) {
+	url := serveConfig(t, clientConfigPage(`{not valid json`))
+
+	if _, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001"); err == nil {
+		t.Fatal("expected an error when client-config is not valid JSON")
+	}
+}
+
+func TestFetchDocInfoMissingConfigReturnsError(t *testing.T) {
+	url := serveConfig(t, `<!DOCTYPE html><html><body>no config here</body></html>`)
+
+	if _, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001"); err == nil {
+		t.Fatal("expected an error when client-config is absent")
+	}
+}
+
+func TestFetchDocInfoValidConfig(t *testing.T) {
+	config := `{"officeActionData":{"balancer_url":"https://balancer.example.net",` +
+		`"editor_config":{"type":"desktop","token":"jwt-token",` +
+		`"document":{"key":"docKey123","fileType":"docx","url":"http://localhost:12701/disk/x",` +
+		`"title":"x.docx","permissions":{"edit":false,"download":true}}}}}`
+
+	url := serveConfig(t, clientConfigPage(config))
+
+	info, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.Token != "jwt-token" {
+		t.Errorf("Token = %q, want %q", info.Token, "jwt-token")
+	}
+	if info.DocID != "docKey123" {
+		t.Errorf("DocID = %q, want %q", info.DocID, "docKey123")
+	}
+	if info.Host != "balancer.example.net" {
+		t.Errorf("Host = %q, want %q", info.Host, "balancer.example.net")
+	}
+	if info.Origin != "https://balancer.example.net" {
+		t.Errorf("Origin = %q, want %q", info.Origin, "https://balancer.example.net")
+	}
+	wantWs := "wss://balancer.example.net/2024.1.1-375/doc/docKey123/c/?EIO=4&transport=websocket"
+	if info.WsURL != wantWs {
+		t.Errorf("WsURL = %q, want %q", info.WsURL, wantWs)
+	}
+	if info.Permissions["download"] != true {
+		t.Errorf("Permissions = %+v, want download=true", info.Permissions)
+	}
+	if got := info.OpenCmd["id"]; got != "docKey123" {
+		t.Errorf("OpenCmd[id] = %v, want %q", got, "docKey123")
+	}
+	if got := info.OpenCmd["userid"]; got != "0000000001" {
+		t.Errorf("OpenCmd[userid] = %v, want %q", got, "0000000001")
+	}
+}
+
+// An absent permissions object must not fail the request; it falls back to an
+// empty map.
+func TestFetchDocInfoMissingPermissionsFallsBack(t *testing.T) {
+	config := `{"officeActionData":{"balancer_url":"https://balancer.example.net",` +
+		`"editor_config":{"type":"desktop","token":"jwt-token",` +
+		`"document":{"key":"docKey123","url":"http://localhost:12701/disk/x"}}}}`
+
+	url := serveConfig(t, clientConfigPage(config))
+
+	info, err := (&YandexDocsTransport{}).fetchDocInfo(url, "0000000001")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.Permissions == nil {
+		t.Error("Permissions should fall back to an empty map, got nil")
 	}
 }

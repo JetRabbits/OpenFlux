@@ -19,12 +19,12 @@ import (
 	"time"
 	"unsafe"
 
-	"universal-bypass-tool/socks5"
-	"universal-bypass-tool/transport"
-	"universal-bypass-tool/transport/oneme"
-	"universal-bypass-tool/transport/yandex"
-	"universal-bypass-tool/tunnel"
-	"universal-bypass-tool/utils"
+	"github.com/JetRabbits/OpenFlux/socks5"
+	"github.com/JetRabbits/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/transport/oneme"
+	"github.com/JetRabbits/OpenFlux/transport/yandex"
+	"github.com/JetRabbits/OpenFlux/tunnel"
+	"github.com/JetRabbits/OpenFlux/utils"
 
 	t2core "github.com/xjasonlyu/tun2socks/v2/core"
 	t2device "github.com/xjasonlyu/tun2socks/v2/core/device"

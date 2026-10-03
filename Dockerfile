@@ -1,31 +1,29 @@
 # syntax=docker/dockerfile:1
+# OpenFlux (openflux) — one image, two roles:
+#   client    — SOCKS5 proxy, no special privileges
+#   exit-node — raw sockets + RST-drop, needs NET_RAW/NET_ADMIN (see compose)
+# Role is selected at runtime by the entrypoint from ROLE=client|exit-node.
 
-FROM --platform=$TARGETPLATFORM golang:1.25-bookworm AS builder
-
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
-
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 
-ENV GOTOOLCHAIN=auto
-
+# Cache module downloads across builds.
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 COPY . .
-RUN CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build \
-      -trimpath \
-      -ldflags="-s -w -checklinkname=0" \
-      -o /out/openflux \
-      .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/openflux .
 
-FROM debian:bookworm-slim
+FROM alpine:3.22
+# ca-certificates: all transports are TLS (wss/https) to Yandex/MAX endpoints.
+# iptables: the exit node must drop kernel RSTs inside its network namespace.
+RUN apk add --no-cache ca-certificates iptables
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates iptables \
-    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/openflux /usr/local/bin/openflux
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/openflux
 
-COPY --from=builder /out/openflux /usr/local/bin/openflux
-
-ENTRYPOINT ["/usr/local/bin/openflux"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

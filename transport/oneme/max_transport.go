@@ -1,8 +1,8 @@
 package oneme
 
 import (
-	"universal-bypass-tool/transport"
-	"universal-bypass-tool/utils"
+	"github.com/JetRabbits/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 type OneMeTransport struct {
