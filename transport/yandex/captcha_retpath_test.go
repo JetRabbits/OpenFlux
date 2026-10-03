@@ -1,6 +1,8 @@
 package yandex
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/cookiejar"
@@ -8,6 +10,25 @@ import (
 	"sync/atomic"
 	"testing"
 )
+
+func captchaHTML(t *testing.T, action string) []byte {
+	t.Helper()
+	ssr := map[string]interface{}{
+		"uniqueKey": "test-key",
+		"action":    action,
+		"pow": map[string]interface{}{
+			"complexity": 0,
+			"prefix":     "00",
+		},
+		"timestamp": int64(1),
+	}
+	raw, err := json.Marshal(ssr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	return []byte(`<html><script>window.__SSR_DATA__ = JSON.parse(atob("` + encoded + `"))</script><form id="tmgrdfrend-form" action="` + action + `"></form></html>`)
+}
 
 func withSolveCaptchaFn(t *testing.T, fn func(string, http.CookieJar, string) (string, error)) {
 	t.Helper()
@@ -177,5 +198,69 @@ func TestCaptchaEmptyRetpathFallsBackToOriginalURL(t *testing.T) {
 				t.Fatalf("original doc requests = %d, want 2", got)
 			}
 		})
+	}
+}
+
+func TestCaptchaRelativeLocationResolvesAndWalkContinues(t *testing.T) {
+	for name, run := range map[string]func(string) error{
+		"ydocs": runFetchDocInfoForTest,
+		"volga": runVolgaAuthorizeForTest,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var retpathRequests atomic.Int32
+			var srv *httptest.Server
+			srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/doc":
+					http.Redirect(w, r, srv.URL+"/showcaptchafast", http.StatusFound)
+				case "/showcaptchafast":
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write(captchaHTML(t, srv.URL+"/checkcaptchafast"))
+				case "/checkcaptchafast":
+					http.Redirect(w, r, "/edit/d/xyz", http.StatusFound)
+				case "/edit/d/xyz":
+					retpathRequests.Add(1)
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte("<html>retpath</html>"))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			_ = run(srv.URL + "/doc")
+
+			if got := retpathRequests.Load(); got != 1 {
+				t.Fatalf("/edit/d/xyz requests = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestSolveCaptchaAbsoluteLocationPassesThroughUnchanged(t *testing.T) {
+	jar, _ := cookiejar.New(nil)
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/doc":
+			http.Redirect(w, r, srv.URL+"/showcaptchafast", http.StatusFound)
+		case "/showcaptchafast":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(captchaHTML(t, srv.URL+"/checkcaptchafast"))
+		case "/checkcaptchafast":
+			http.Redirect(w, r, srv.URL+"/edit/d/absolute", http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	retpath, err := solveCaptcha(srv.URL+"/doc", jar, "test-agent")
+	if err != nil {
+		t.Fatalf("solveCaptcha returned error: %v", err)
+	}
+	want := srv.URL + "/edit/d/absolute"
+	if retpath != want {
+		t.Fatalf("retpath = %q, want %q", retpath, want)
 	}
 }

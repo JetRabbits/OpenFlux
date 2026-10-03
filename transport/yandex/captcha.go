@@ -18,12 +18,14 @@ import (
 	"openflux/utils"
 )
 
+// solveCaptchaFn is a test seam for transports that need to exercise the
+// redirect walk without solving the captcha PoW flow.
+var solveCaptchaFn = solveCaptcha
+
 // solveCaptcha проходит Яндекс-капчу (blink-check) для заданного URL.
 //
 // Возвращает retpath (пустая строка = капча не требовалась).
 // Cookies в jar обновляются на месте.
-var solveCaptchaFn = solveCaptcha
-
 func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, error) {
 	if jar == nil {
 		return "", fmt.Errorf("captcha: nil cookiejar")
@@ -142,13 +144,44 @@ func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, 
 		return "", fmt.Errorf("captcha POST unexpected status %d", resp2.StatusCode)
 	}
 
-	retpath := resp2.Header.Get("Location")
-	if retpath == "" {
-		retpath = docURL
+	retpath, retpathRelative, err := normalizeRetpath(resp2.Header.Get("Location"), req2.URL, docURL)
+	if err != nil {
+		return "", err
 	}
 
-	utils.Debugf("[CAPTCHA] solve OK, retpath=%s", shortStr(retpath, 120))
+	utils.Debugf("[CAPTCHA] solve OK, retpath host=%s relative=%t", safeDocURL(retpath), retpathRelative)
 	return retpath, nil
+}
+
+func normalizeRetpath(loc string, postURL *url.URL, fallback string) (string, bool, error) {
+	if loc != "" {
+		ref, err := url.Parse(loc)
+		if err != nil {
+			return "", false, fmt.Errorf("captcha retpath parse: %w", err)
+		}
+		if ref.IsAbs() {
+			return ref.String(), false, nil
+		}
+		if postURL == nil {
+			return "", true, fmt.Errorf("captcha retpath relative without POST URL")
+		}
+		return postURL.ResolveReference(ref).String(), true, nil
+	}
+
+	if fallback == "" {
+		return "", false, nil
+	}
+	ref, err := url.Parse(fallback)
+	if err != nil {
+		return "", false, fmt.Errorf("captcha fallback retpath parse: %w", err)
+	}
+	if ref.IsAbs() {
+		return ref.String(), false, nil
+	}
+	if postURL == nil {
+		return "", true, fmt.Errorf("captcha fallback retpath relative without POST URL")
+	}
+	return postURL.ResolveReference(ref).String(), true, nil
 }
 
 // ---- парсинг showcaptchafast ----
