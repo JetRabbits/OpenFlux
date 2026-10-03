@@ -42,7 +42,51 @@ var (
 
 	ydocWriteDeadline = 10 * time.Second
 	ydocReadDeadline  = 75 * time.Second
+
+	// legacyWSUserAgent is the exact User-Agent the mobile clients sent on
+	// the docs WebSocket handshake before Chrome emulation was introduced.
+	legacyWSUserAgent = "Mozilla/5.0"
+
+	// wsChromeLike guards the Chrome-like (utls + Chrome UA) docs WebSocket
+	// handshake. The standalone server needs it to survive SmartCaptcha on
+	// datacenter IPs; embedded clients dial the docs WebSocket plain with a
+	// legacy UA. See SetWSChromeLike.
+	wsChromeLike = true
 )
+
+// SetWSChromeLike toggles Chrome-like TLS (utls) and User-Agent on the
+// Yandex Docs WebSocket handshake. Defaults to true (standalone server
+// behavior). Embedded/mobile binaries should call this with false during
+// initialization: rendezvous over a plain TLS WebSocket is what mobile
+// deployments are validated against. It has no effect on the HTTP
+// redirect-hop client, which always uses the Chrome-like helper.
+func SetWSChromeLike(enabled bool) { wsChromeLike = enabled }
+
+// newDocWSDialer builds the Yandex Docs WebSocket dialer honoring
+// wsChromeLike. The hard TCP dial timeout keeps a stuck connect/DNS to the
+// balancer host from hanging the whole transport (HandshakeTimeout alone
+// proved insufficient on iOS).
+func newDocWSDialer() websocket.Dialer {
+	d := websocket.Dialer{
+		HandshakeTimeout: 15 * time.Second,
+		NetDialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+	if wsChromeLike {
+		d.NetDialTLSContext = chromeLikeDialTLSContext
+	}
+	return d
+}
+
+// docWSUserAgent returns the handshake User-Agent matching wsChromeLike.
+func docWSUserAgent() string {
+	if wsChromeLike {
+		return chromeUserAgent
+	}
+	return legacyWSUserAgent
+}
 
 type YandexDocsInfo struct {
 	CookieStr   string
@@ -200,19 +244,10 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			return
 		}
 
-		// Hard TCP dial timeout so a stuck connect/DNS to the balancer host
-		// can't hang the whole transport (HandshakeTimeout alone proved
-		// insufficient on iOS).
-		dialer := websocket.Dialer{
-			HandshakeTimeout:  15 * time.Second,
-			NetDialTLSContext: chromeLikeDialTLSContext,
-			NetDialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-		}
+		// Docs WebSocket honors wsChromeLike (see SetWSChromeLike).
+		dialer := newDocWSDialer()
 		headers := http.Header{}
-		headers.Set("User-Agent", chromeUserAgent)
+		headers.Set("User-Agent", docWSUserAgent())
 		headers.Set("Origin", info.Origin)
 		headers.Set("Cookie", info.CookieStr)
 		headers.Set("Host", info.Host)
