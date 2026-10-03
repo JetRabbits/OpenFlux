@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,8 +30,11 @@ const (
 	DefaultHandshakeTimeout   = 10 * time.Second
 	DefaultSessionIdleTimeout = 75 * time.Second
 	DefaultUDPEndpointTimeout = 15 * time.Second
-	DefaultSlotWaitTimeout    = 30 * time.Second
+	DefaultSlotWaitTimeout    = 2 * time.Second
 	DefaultDialTimeout        = 20 * time.Second
+
+	DefaultFootprintPauseBytes  = 36 << 20
+	DefaultFootprintResumeBytes = 32 << 20
 )
 
 type flowLimits struct {
@@ -58,6 +62,56 @@ type SOCKS5Server struct {
 	activeUDP  atomic.Int32
 	refusedTCP atomic.Uint64
 	refusedUDP atomic.Uint64
+}
+
+var (
+	flowRejectedTCP atomic.Uint64
+	flowRejectedUDP atomic.Uint64
+	flowCapWaits    atomic.Uint64
+
+	admissionMu              sync.RWMutex
+	admissionFootprintSource func() uint64
+	admissionPauseBytes      uint64
+	admissionResumeBytes     uint64
+	admissionEngaged         atomic.Bool
+	admissionLastCompact     atomic.Int64
+)
+
+func FlowRejectStats() (tcpRejected, udpRejected, capWaits uint64) {
+	return flowRejectedTCP.Load(), flowRejectedUDP.Load(), flowCapWaits.Load()
+}
+
+func resetFlowRejectStatsForTest() {
+	flowRejectedTCP.Store(0)
+	flowRejectedUDP.Store(0)
+	flowCapWaits.Store(0)
+}
+
+func SetFootprintAdmissionControl(source func() uint64, pauseBytes, resumeBytes uint64) {
+	admissionMu.Lock()
+	defer admissionMu.Unlock()
+	admissionFootprintSource = source
+	admissionPauseBytes = pauseBytes
+	admissionResumeBytes = resumeBytes
+	if pauseBytes == 0 {
+		admissionPauseBytes = DefaultFootprintPauseBytes
+	}
+	if resumeBytes == 0 || resumeBytes >= admissionPauseBytes {
+		admissionResumeBytes = DefaultFootprintResumeBytes
+	}
+	admissionEngaged.Store(false)
+}
+
+func currentAdmissionFootprint() (uint64, uint64, uint64, bool) {
+	admissionMu.RLock()
+	source := admissionFootprintSource
+	pause := admissionPauseBytes
+	resume := admissionResumeBytes
+	admissionMu.RUnlock()
+	if source == nil {
+		return 0, 0, 0, false
+	}
+	return source(), pause, resume, true
 }
 
 func NewSOCKS5Server(addr string, dialer Dialer) *SOCKS5Server {
@@ -255,6 +309,7 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 	case 0x01:
 		if !s.reserveFlow(false) {
 			s.refusedTCP.Add(1)
+			flowRejectedTCP.Add(1)
 			utils.Debugf("[SOCKS5] TCP flow cap reached, rejecting CONNECT %s", targetAddr)
 			writeReply(clientConn, 0x02, nil)
 			return
@@ -264,6 +319,7 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 	case 0x03:
 		if !s.reserveFlow(true) {
 			s.refusedUDP.Add(1)
+			flowRejectedUDP.Add(1)
 			utils.Debugf("[SOCKS5] UDP flow cap reached, rejecting ASSOCIATE")
 			writeReply(clientConn, 0x02, nil)
 			return
@@ -395,9 +451,14 @@ func (s *SOCKS5Server) slotWait() time.Duration {
 
 func (s *SOCKS5Server) reserveFlow(udp bool) bool {
 	deadline := time.Now().Add(s.slotWait())
+	waitCounted := false
 	for {
 		if s.tryReserveFlow(udp) {
 			return true
+		}
+		if !waitCounted {
+			flowCapWaits.Add(1)
+			waitCounted = true
 		}
 		if time.Now().After(deadline) {
 			return false
@@ -407,20 +468,32 @@ func (s *SOCKS5Server) reserveFlow(udp bool) bool {
 }
 
 func (s *SOCKS5Server) tryReserveFlow(udp bool) bool {
+	if !s.footprintAllowsAdmission() {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tcp, udpCount := s.activeTCP.Load(), s.activeUDP.Load()
-	if int(tcp+udpCount) >= s.limits.maxTotal {
-		return false
-	}
+	maxTCP, maxUDP, maxTotal := s.limits.maxTCP, s.limits.maxUDP, s.limits.maxTotal
 	if udp {
-		if int(udpCount) >= s.limits.maxUDP {
+		tcpHeadroom := maxTCP
+		if tcpHeadroom > maxTotal {
+			tcpHeadroom = maxTotal
+		}
+		maxUDPWithinTotal := maxTotal - tcpHeadroom
+		if maxUDPWithinTotal < 0 {
+			maxUDPWithinTotal = 0
+		}
+		if int(udpCount) >= maxUDP || int(udpCount) >= maxUDPWithinTotal {
 			return false
 		}
 		s.activeUDP.Add(1)
 		return true
 	}
-	if int(tcp) >= s.limits.maxTCP {
+	if int(tcp+udpCount) >= maxTotal {
+		return false
+	}
+	if int(tcp) >= maxTCP {
 		return false
 	}
 	s.activeTCP.Add(1)
@@ -433,9 +506,42 @@ func (s *SOCKS5Server) releaseFlow(udp bool) {
 	} else {
 		s.activeTCP.Add(-1)
 	}
+	if s.admissionClosedAfterPressure() {
+		debug.FreeOSMemory()
+	}
 }
 
-const relayBufferSize = 8 * 1024
+func (s *SOCKS5Server) admissionClosedAfterPressure() bool {
+	footprint, _, resume, ok := currentAdmissionFootprint()
+	return ok && admissionEngaged.Load() && footprint < resume
+}
+
+func (s *SOCKS5Server) footprintAllowsAdmission() bool {
+	footprint, pause, resume, ok := currentAdmissionFootprint()
+	if !ok || footprint == 0 {
+		return true
+	}
+	if admissionEngaged.Load() {
+		if footprint < resume {
+			admissionEngaged.Store(false)
+			utils.Debugf("[SOCKS5] footprint admission resumed footprint=%d resume=%d", footprint, resume)
+			return true
+		}
+		return false
+	}
+	if footprint >= pause {
+		admissionEngaged.Store(true)
+		utils.Debugf("[SOCKS5] footprint admission paused footprint=%d pause=%d resume=%d", footprint, pause, resume)
+		if time.Since(time.Unix(0, admissionLastCompact.Load())) > 2*time.Second {
+			admissionLastCompact.Store(time.Now().UnixNano())
+			debug.FreeOSMemory()
+		}
+		return false
+	}
+	return true
+}
+
+const relayBufferSize = 4 * 1024
 
 var relayBufferPool = sync.Pool{New: func() any { b := make([]byte, relayBufferSize); return &b }}
 

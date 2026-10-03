@@ -339,6 +339,15 @@ func (t *TCPTunnel) Close() {
 	})
 }
 
+func (t *TCPTunnel) Closed() bool {
+	select {
+	case <-t.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
 func (t *TCPTunnel) printStats() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()

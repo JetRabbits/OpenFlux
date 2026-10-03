@@ -69,11 +69,20 @@ func logOutput() io.Writer {
 // SetOutput redirects all debug and standard log output to w.
 // Used by the mobile bridge to pipe logs into the app UI.
 func SetOutput(w io.Writer) {
+	if w == nil {
+		w = defaultStderr
+	}
 	output = w
 	log.SetOutput(w)
 	if debugLog != nil {
 		debugLog.SetOutput(w)
 	}
+}
+
+// SetDebugSink replaces the destination used by Debugf's rate-limited writer.
+// Passing nil restores the historical default path to stderr.
+func SetDebugSink(w io.Writer) {
+	SetOutput(w)
 }
 
 func EnableDebug() {
