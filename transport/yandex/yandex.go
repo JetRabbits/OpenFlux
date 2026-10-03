@@ -212,7 +212,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			}).DialContext,
 		}
 		headers := http.Header{}
-		headers.Set("User-Agent", "Mozilla/5.0")
+		headers.Set("User-Agent", chromeUserAgent)
 		headers.Set("Origin", info.Origin)
 		headers.Set("Cookie", info.CookieStr)
 		headers.Set("Host", info.Host)
@@ -578,7 +578,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		return http.ErrUseLastResponse
 	}
 
-	ua := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
+	ua := chromeUserAgent
 
 	// Явно следуем по редиректам: до 10 хопов.
 	currentURL := url

@@ -31,7 +31,7 @@ func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, 
 		return "", fmt.Errorf("captcha: nil cookiejar")
 	}
 	if userAgent == "" {
-		userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
+		userAgent = chromeUserAgent
 	}
 
 	client := chromeLikeHTTPClient(jar, 30*time.Second)
