@@ -34,12 +34,9 @@ func solveCaptcha(docURL string, jar http.CookieJar, userAgent string) (string, 
 		userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
 	}
 
-	client := &http.Client{
-		Jar:     jar,
-		Timeout: 30 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+	client := chromeLikeHTTPClient(jar, 30*time.Second)
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
 
 	utils.Debugf("[CAPTCHA] solve start: url=%s", docURL)
@@ -323,19 +320,7 @@ func encodeCaptchaFingerprint(fp map[string]interface{}) string {
 // ---- helpers ----
 
 func setBrowserHeaders(req *http.Request, userAgent string) {
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Accept-Encoding", "gzip, deflate")
-	req.Header.Set("Sec-GPC", "1")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	req.Header.Set("Sec-Fetch-Dest", "document")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Sec-Fetch-Site", "none")
-	req.Header.Set("Sec-Fetch-User", "?1")
-	req.Header.Set("Pragma", "no-cache")
-	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("Connection", "keep-alive")
+	setChromeLikeHeaders(req, userAgent)
 }
 
 func hexEncode(b []byte) string {

@@ -204,7 +204,8 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		// can't hang the whole transport (HandshakeTimeout alone proved
 		// insufficient on iOS).
 		dialer := websocket.Dialer{
-			HandshakeTimeout: 15 * time.Second,
+			HandshakeTimeout:  15 * time.Second,
+			NetDialTLSContext: chromeLikeDialTLSContext,
 			NetDialContext: (&net.Dialer{
 				Timeout:   10 * time.Second,
 				KeepAlive: 30 * time.Second,
@@ -571,13 +572,10 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		}
 	}
 
-	client := &http.Client{
-		Jar: jar,
-		// НЕ следуем редиректам автоматически — обрабатываем вручную.
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-		Timeout: 15 * time.Second,
+	client := chromeLikeHTTPClient(jar, 15*time.Second)
+	// НЕ следуем редиректам автоматически — обрабатываем вручную.
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
 
 	ua := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:153.0) Gecko/20100101 Firefox/153.0"
@@ -592,7 +590,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		utils.Debugf("[YDOCS] hop %d: GET %s", hop, shortStr(currentURL, 120))
 
 		req, _ := http.NewRequest("GET", currentURL, nil)
-		req.Header.Set("User-Agent", ua)
+		setChromeLikeHeaders(req, ua)
 		resp, err = client.Do(req)
 		if err != nil {
 			return YandexDocsInfo{}, fmt.Errorf("GET %s: %w", currentURL, err)

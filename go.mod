@@ -17,12 +17,14 @@ require (
 	github.com/klauspost/compress v1.20.0
 	github.com/pierrec/lz4/v4 v4.1.27
 	github.com/pion/webrtc/v3 v3.3.6
+	github.com/refraction-networking/utls v1.8.2
 	github.com/xjasonlyu/tun2socks/v2 v2.7.0
 	github.com/xjasonlyu/windivert-go v0.0.0-20201010013527-4239d0afa76f
 	golang.org/x/crypto v0.53.0
 )
 
 require (
+	github.com/andybalholm/brotli v1.0.6 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/pion/datachannel v1.5.8 // indirect
