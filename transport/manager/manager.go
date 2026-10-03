@@ -13,9 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"openflux/transport"
-	"openflux/transport/control"
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/transport/control"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // Factory builds a raw transport from a control.TransportConfig.

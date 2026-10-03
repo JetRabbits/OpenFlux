@@ -1,6 +1,6 @@
 package tunnel
 
-import "openflux/transport"
+import "github.com/JetRabbits/OpenFlux/transport"
 
 type proxyExit struct {
 	trans transport.Transport

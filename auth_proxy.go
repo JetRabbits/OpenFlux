@@ -4,9 +4,9 @@ import (
 	"net"
 	"sync"
 
-	"openflux/transport"
-	"openflux/tunnel"
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/tunnel"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // Local TCP ports reserved for the remote-auth side stack. They sit below

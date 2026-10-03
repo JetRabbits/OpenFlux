@@ -5,8 +5,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"openflux/transport"
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 const clientIP = "10.10.10.2"

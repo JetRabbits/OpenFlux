@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"strconv"
 
-	"openflux/transport"
-	"openflux/transport/control"
-	"openflux/transport/cupsonline"
-	"openflux/transport/mailru"
-	"openflux/transport/manager"
-	"openflux/transport/oneme"
-	"openflux/transport/yandex"
+	"github.com/JetRabbits/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/transport/control"
+	"github.com/JetRabbits/OpenFlux/transport/cupsonline"
+	"github.com/JetRabbits/OpenFlux/transport/mailru"
+	"github.com/JetRabbits/OpenFlux/transport/manager"
+	"github.com/JetRabbits/OpenFlux/transport/oneme"
+	"github.com/JetRabbits/OpenFlux/transport/yandex"
 )
 
 // transportFactory builds a raw transport from a control.TransportConfig.

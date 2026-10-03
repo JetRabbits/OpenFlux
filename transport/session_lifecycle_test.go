@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"openflux/transport/control"
+	"github.com/JetRabbits/OpenFlux/transport/control"
 )
 
 var testParams = PeerParameters{

@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // DirectConfig configures the DirectTransport.

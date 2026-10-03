@@ -1,4 +1,4 @@
-module openflux
+module github.com/JetRabbits/OpenFlux
 
 go 1.26.4
 

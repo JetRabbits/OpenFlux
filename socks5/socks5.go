@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 type Dialer interface {

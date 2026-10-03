@@ -20,11 +20,11 @@ import (
 	"time"
 	"unsafe"
 
-	"openflux/network"
-	"openflux/transport"
-	"openflux/transport/oneme"
-	"openflux/transport/yandex"
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/network"
+	"github.com/JetRabbits/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/transport/oneme"
+	"github.com/JetRabbits/OpenFlux/transport/yandex"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // Packet-tunnel (NEPacketTunnelProvider) mode — pure L3 forwarding.

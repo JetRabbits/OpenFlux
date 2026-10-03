@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // HostLearner periodically snapshots TCP connections of the running process

@@ -1,10 +1,10 @@
 package transport_test
 
 import (
-	"openflux/transport"
-	"openflux/transport/cupsonline"
-	"openflux/transport/mailru"
-	"openflux/transport/yandex"
+	"github.com/JetRabbits/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/transport/cupsonline"
+	"github.com/JetRabbits/OpenFlux/transport/mailru"
+	"github.com/JetRabbits/OpenFlux/transport/yandex"
 )
 
 // Compile-time guarantees that every HTTP-based transport implements

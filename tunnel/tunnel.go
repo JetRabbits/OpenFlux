@@ -17,9 +17,9 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 
-	"openflux/transport"
-	"openflux/tunnel/l3"
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/tunnel/l3"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // ExitMode выбирает, как выходная нода общается с интернетом.

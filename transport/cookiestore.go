@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // CookieStore is a small persistent store for per-session cookie jars.

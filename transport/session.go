@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"openflux/transport/control"
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/transport/control"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // Session is one logical session between a client and an exit node.

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // Handler receives decoded messages from the connected client.

@@ -19,12 +19,12 @@ import (
 	"time"
 	"unsafe"
 
-	"openflux/socks5"
-	"openflux/transport"
-	"openflux/transport/oneme"
-	"openflux/transport/yandex"
-	"openflux/tunnel"
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/socks5"
+	"github.com/JetRabbits/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/transport/oneme"
+	"github.com/JetRabbits/OpenFlux/transport/yandex"
+	"github.com/JetRabbits/OpenFlux/tunnel"
+	"github.com/JetRabbits/OpenFlux/utils"
 
 	t2core "github.com/xjasonlyu/tun2socks/v2/core"
 	t2device "github.com/xjasonlyu/tun2socks/v2/core/device"

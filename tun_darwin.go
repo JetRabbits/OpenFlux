@@ -11,8 +11,8 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"openflux/transport"
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // TUNClient is a macOS utun-based L3 forwarder: no gVisor, no SOCKS5.

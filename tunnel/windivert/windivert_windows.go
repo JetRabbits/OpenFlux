@@ -10,8 +10,8 @@ import (
 
 	"github.com/xjasonlyu/windivert-go"
 
-	"openflux/network"
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/network"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 const recvBufSize = 65535

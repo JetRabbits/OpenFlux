@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // solveCaptchaFn is a test seam for transports that need to exercise the

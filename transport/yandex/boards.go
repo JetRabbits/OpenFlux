@@ -20,8 +20,8 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"openflux/transport"
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 const (

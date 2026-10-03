@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"openflux/transport"
+	"github.com/JetRabbits/OpenFlux/transport"
 )
 
 type pairedTransport struct {

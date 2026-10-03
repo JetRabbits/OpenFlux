@@ -3,7 +3,7 @@ package l3
 import (
 	"encoding/binary"
 	"errors"
-	"openflux/transport"
+	"github.com/JetRabbits/OpenFlux/transport"
 	"sync/atomic"
 	"time"
 )

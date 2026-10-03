@@ -3,7 +3,7 @@ package l3
 import (
 	"bytes"
 	"encoding/binary"
-	"openflux/transport"
+	"github.com/JetRabbits/OpenFlux/transport"
 	"testing"
 	"time"
 )

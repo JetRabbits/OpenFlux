@@ -19,8 +19,8 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"openflux/transport"
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // ErrCaptchaRequired signals that the transport hit a SmartCaptcha challenge

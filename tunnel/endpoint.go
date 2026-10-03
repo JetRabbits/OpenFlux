@@ -10,8 +10,8 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 
-	"openflux/network"
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/network"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 type TunnelLinkEndpoint struct {

@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"openflux/utils"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // Defaults for the coalescing layer. Tunable at runtime via env vars so the
