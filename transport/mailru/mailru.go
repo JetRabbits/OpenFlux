@@ -421,6 +421,16 @@ func (t *MailruDocsTransport) keepAliveLoop() {
 	}
 }
 
+// canEdit says whether the document may be edited through the link this session joined with.
+// The server reports it in the document's permissions; a document that does not say is treated
+// as editable, as the transport always did. Our fork's mailru transport never sends
+// saveChanges (the upstream editorActivityLoop was never merged here), so this is kept for
+// permissions parity and is used by edit_test.go; guard any future saveChanges sender with it.
+func canEdit(permissions map[string]interface{}) bool {
+	edit, ok := permissions["edit"].(bool)
+	return !ok || edit
+}
+
 func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 	text := string(data)
 
