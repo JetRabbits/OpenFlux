@@ -51,10 +51,14 @@ func TestLiveMailru(t *testing.T) {
 		hold = d
 	}
 
+	// Upstream's utils has a level API (SetLevel); this fork's utils only
+	// toggles debug, so EnableDebug is the equivalent switch that makes
+	// the transport's Debugf lines (Auth OK, reconnecting in) reach the sink.
 	logs := &lockedBuffer{}
 	utils.SetOutput(logs)
-	utils.SetDebug(true)
+	utils.EnableDebug()
 	defer utils.SetOutput(os.Stderr)
+	defer utils.SetDebug(false)
 
 	tr := NewMailruDocsTransport(url, transport.DefaultConfig())
 	if err := tr.Start(); err != nil {
