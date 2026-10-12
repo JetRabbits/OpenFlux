@@ -28,7 +28,10 @@ import (
 	"github.com/JetRabbits/OpenFlux/utils"
 )
 
-const mailruUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+// Mail.ru rejects the old Chrome/137 UA on the WebSocket upgrade with HTTP 409
+// on some edge nodes; a current Firefox UA is accepted for both the API and the
+// WebSocket. Reported by @Shiller70 (issue #164).
+const mailruUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:155.0) Gecko/20100101 Firefox/155.0"
 
 var cursorPayloadRe = regexp.MustCompile(`"cursor":"[^;]+;([^"]+)"`)
 
@@ -56,6 +59,81 @@ func (s *DocSession) safeWrite(messageType int, data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	return s.Conn.WriteMessage(messageType, data)
+}
+
+const mailruSocketIOHandshakeTimeout = 15 * time.Second
+
+// waitMailruSocketIO completes the Engine.IO / Socket.IO handshake before
+// editor authentication is sent. Mail.ru currently requires the Engine.IO
+// open frame to be consumed before the Socket.IO connect packet is sent.
+func waitMailruSocketIO(session *DocSession, token string) error {
+	if session == nil || session.Conn == nil {
+		return fmt.Errorf("mailru: websocket session is nil")
+	}
+
+	conn := session.Conn
+
+	if err := conn.SetReadDeadline(time.Now().Add(mailruSocketIOHandshakeTimeout)); err != nil {
+		return fmt.Errorf("mailru: set handshake deadline: %w", err)
+	}
+	defer conn.SetReadDeadline(time.Time{})
+
+	waitFor := func(match func(string) bool) error {
+		for {
+			messageType, payload, err := conn.ReadMessage()
+			if err != nil {
+				return err
+			}
+
+			if messageType != websocket.TextMessage {
+				continue
+			}
+
+			text := string(payload)
+
+			// Engine.IO heartbeat may arrive while handshaking.
+			if text == "2" {
+				if err := session.safeWrite(websocket.TextMessage, []byte("3")); err != nil {
+					return fmt.Errorf("mailru: send Engine.IO pong: %w", err)
+				}
+				continue
+			}
+
+			if match(text) {
+				return nil
+			}
+
+			utils.Debugf("[M-DOCS] handshake: ignoring server frame %q", text)
+		}
+	}
+
+	// Engine.IO open:
+	//   0{"sid":"...", ...}
+	if err := waitFor(func(text string) bool {
+		return strings.HasPrefix(text, "0{")
+	}); err != nil {
+		return fmt.Errorf("mailru: wait for Engine.IO open: %w", err)
+	}
+
+	utils.Debugf("[M-DOCS] Engine.IO open")
+
+	socketConnect := fmt.Sprintf(`40{"token":"%s"}`, token)
+
+	if err := session.safeWrite(websocket.TextMessage, []byte(socketConnect)); err != nil {
+		return fmt.Errorf("mailru: send Socket.IO connect: %w", err)
+	}
+
+	// Socket.IO acknowledgement:
+	//   40{"sid":"..."}
+	if err := waitFor(func(text string) bool {
+		return strings.HasPrefix(text, "40")
+	}); err != nil {
+		return fmt.Errorf("mailru: wait for Socket.IO connect: %w", err)
+	}
+
+	utils.Debugf("[M-DOCS] Socket.IO connected")
+
+	return nil
 }
 
 type MailruDocsTransport struct {
@@ -167,7 +245,15 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		}
 
 		dialer := websocket.Dialer{
-			HandshakeTimeout: 15 * time.Second,
+			// Mail.ru's nginx answers 409 Conflict to an upgrade that does
+			// not offer permessage-deflate. gorilla/websocket only sends the
+			// Sec-WebSocket-Extensions header when compression is enabled, so
+			// without this the handshake was rejected before any auth and the
+			// carrier never came up. Reported by @pirsasha (issue #163).
+			EnableCompression: true,
+			HandshakeTimeout:  15 * time.Second,
+			// Upstream wraps this dialer in netbind for interface pinning;
+			// this fork has no netbind, so the bare dialer stays as-is.
 			NetDialContext: (&net.Dialer{
 				Timeout:   10 * time.Second,
 				KeepAlive: 30 * time.Second,
@@ -175,6 +261,10 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		}
 		headers := http.Header{}
 		headers.Set("User-Agent", mailruUserAgent)
+		// Some Mail.ru edge nodes still answer 409 to the upgrade when the
+		// request looks less like a browser than the others; a real browser
+		// always sends Accept-Language. Reported to still hit iOS (#164).
+		headers.Set("Accept-Language", "en-US,en;q=0.9")
 		headers.Set("Origin", "https://docs.datacloudmail.ru")
 
 		utils.Debugf("[M-DOCS] WebSocket dial %s", info.WsURL)
@@ -202,6 +292,13 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			UserID:     userID,
 		}
 
+		if err := waitMailruSocketIO(session, info.Token); err != nil {
+			utils.Debugf("[M-DOCS] Socket.IO handshake failed: %v", err)
+			_ = conn.Close()
+			t.scheduleReconnect(attempt)
+			return
+		}
+
 		t.Mu.Lock()
 		t.session = session
 		t.SetConnected(true)
@@ -210,16 +307,6 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		if existingSession == nil {
 			utils.SafeGo("mailru.writer", t.writerLoop)
 		}
-
-		// Auth - fired immediately, same as the Yandex.Docs transport. No
-		// need to wait for the server's own "0{"/"40" handshake frames
-		// first: Mail.ru's coauthoring server buffers and processes these
-		// once its own session state catches up, and waiting for explicit
-		// acks here only stretches the outage window on every reconnect
-		// (Mail.ru can delay a fresh joiner's auth confirmation by up to
-		// ~30s while it reconciles with the other participant).
-		auth1 := fmt.Sprintf(`40{"token":"%s"}`, info.Token)
-		session.safeWrite(websocket.TextMessage, []byte(auth1))
 
 		authMsg := map[string]interface{}{
 			"type":                "auth",
@@ -349,6 +436,16 @@ func (t *MailruDocsTransport) keepAliveLoop() {
 	}
 }
 
+// canEdit says whether the document may be edited through the link this session joined with.
+// The server reports it in the document's permissions; a document that does not say is treated
+// as editable, as the transport always did. Our fork's mailru transport never sends
+// saveChanges (the upstream editorActivityLoop was never merged here), so this is kept for
+// permissions parity and is used by edit_test.go; guard any future saveChanges sender with it.
+func canEdit(permissions map[string]interface{}) bool {
+	edit, ok := permissions["edit"].(bool)
+	return !ok || edit
+}
+
 func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 	text := string(data)
 
@@ -460,6 +557,7 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 	req, _ := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonData))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("User-Agent", mailruUserAgent)
 	req.Header.Set("X-Api-Version", "4")
 	req.Header.Set("Referer", fmt.Sprintf("https://cloud.mail.ru/public/%s?weblink=%s", weblink, weblink))
