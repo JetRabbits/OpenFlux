@@ -1,3 +1,28 @@
+// Package cupsonline implements a covert tunnel over interview.cups.online
+// rooms (Centrifugo 4.1.5 websocket + Django RPC validation).
+//
+// Data channel: shared_editor_change_code. The room's shared code document is
+// the carrier: each side (exit = "X", client = "Y") owns a fenced block of
+// lines at the END of the document ("//OCX-<roomidx>-BEGIN" ... "-END") whose
+// body is the length-prefixed packet batch, base64'd and chunked into short
+// lines. A send computes the document with our block replaced, diffs it
+// against our baseline (fetched via shared_editor_room_info after subscribe and
+// kept current from every code_update push / RPC reply), and ships the minimal
+// unified diff through the "shared_editor_change_code" RPC; the server applies
+// the diff, bumps the version and broadcasts a code_update push containing the
+// FULL document to all subscribers. Receivers strip their own block, decode the
+// peer's block, and dedupe repeat pushes by version + payload hash (our own
+// edits echo back to us). A 400 from change_code means our baseline went stale
+// under a concurrent peer edit — the sender refetches room_info and retries
+// against the fresh document (bounded).
+//
+// Why not cursors: until 2026-10 data rode in the "column" field of
+// shared_editor_change_cursors as base64. In October 2026 the server started
+// validating cursor fields as integers ("Введите правильное число." on any
+// string column), which kills the cursor channel outright — every send is
+// rejected with a 400 and nothing relays. The code-editing RPC above is the
+// live replacement observed in a real browser protocol capture: it still
+// accepts arbitrary percent-encoded text and still broadcasts to everyone.
 package cupsonline
 
 import (
@@ -12,6 +37,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,6 +55,12 @@ const (
 	cupsUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
 )
 
+// roomBaseURL is the live room endpoint the transport actually talks to. It is
+// a package-level seam over baseRoomURL so in-package tests can point the
+// constructors at a fake cups.online deployment (httptest). Production code
+// never reassigns it.
+var roomBaseURL = baseRoomURL
+
 type CupsonlineConfig struct {
 	WSHandshakeTimeout  time.Duration
 	WSReadTimeout       time.Duration
@@ -42,6 +74,13 @@ type CupsonlineConfig struct {
 	BatchMaxPackets int
 	BatchMaxBytes   int
 	BatchTimeout    time.Duration
+
+	// MaxCodeBytesPerBatch limits the framed payload carried in ONE
+	// shared_editor_change_code call (base64 of it lands in the room code
+	// document). Keeps the total document around template + 2 blocks < ~8KB.
+	// We own only our own block, so an oversized doc always self-heals: the
+	// next send replaces our whole block with a fresh bounded payload.
+	MaxCodeBytesPerBatch int
 
 	SendQueueSize int
 
@@ -66,11 +105,14 @@ func DefaultCupsonlineConfig() CupsonlineConfig {
 		ReconnectMultiplier: 1.3,
 		HTTPTimeout:         30 * time.Second,
 
-		// 32 KB — проверено probe'ом: column 49152 OK, 65536 CLOSED.
-		// 32 KB батч → ~43 KB base64 → push ~43 KB < 64 KB лимита.
+		// BatchMaxBytes остаётся жёстким потолком пакета (probe-era legacy);
+		// фактический гейт отправки — Min(BatchMaxBytes, MaxCodeBytesPerBatch),
+		// т.к. payload теперь живёт в тексте комнаты (base64 ×4/3).
 		BatchMaxPackets: 64,
 		BatchMaxBytes:   32 * 1024,
 		BatchTimeout:    2 * time.Millisecond,
+
+		MaxCodeBytesPerBatch: 3072,
 
 		SendQueueSize: 65536,
 
@@ -199,7 +241,7 @@ func authorize(roomURL string) (*cupsAuth, error) {
 
 func createRooms(baseURL string, n int, pause time.Duration) ([]*cupsAuth, error) {
 	if baseURL == "" {
-		baseURL = baseRoomURL
+		baseURL = roomBaseURL
 	}
 	out := make([]*cupsAuth, 0, n)
 	delay := pause
@@ -290,6 +332,32 @@ type cupsWS struct {
 	rpcID   atomic.Int64
 	onData  func([]byte)
 
+	// Code channel identity: exit owns "X" blocks, client owns "Y" blocks.
+	// roomIdx is only cosmetic (marker text); peer-block lookup matches the
+	// side tag with any index so both peers stay compatible even if their
+	// room lists drift apart.
+	side     string // "X" (exit) or "Y" (client)
+	peerSide string
+	roomIdx  int
+
+	// Code baseline, guarded by codeMu: the last known full room-code text
+	// plus its server version (-1 = never learned).
+	codeMu      sync.Mutex
+	serverCode  string
+	codeVersion int64
+
+	// RPC reply correlation: callRPC registers a reply channel under the
+	// frame id; the read loop routes {"id":N,...} frames here.
+	pendingMu sync.Mutex
+	pending   map[int64]chan rpcResp
+
+	// Peer-data dedupe (own edits echo back as code_update pushes). These
+	// fields are touched only from the read-loop goroutine (which includes
+	// the inline baseline fetch inside connectAndServe).
+	havePeerState bool
+	lastPeerHash  uint64
+	observedVer   int64
+
 	ctx       chan struct{}
 	closed    atomic.Bool
 	connected atomic.Bool
@@ -299,7 +367,63 @@ type cupsWS struct {
 	stats *channelStats
 }
 
+type rpcResp struct {
+	data json.RawMessage
+	err  error
+}
+
+var errWSReset = fmt.Errorf("websocket reconnected")
+
 func (w *cupsWS) nextID() int64 { return w.rpcID.Add(1) }
+
+// callRPC sends one Centrifugo RPC frame and waits for the reply correlated by
+// frame id. Replies arrive through the read loop (handleMessage → pending).
+func (w *cupsWS) callRPC(method string, data map[string]interface{}, timeout time.Duration) (json.RawMessage, error) {
+	id := w.nextID()
+	ch := make(chan rpcResp, 1)
+	w.pendingMu.Lock()
+	if w.pending == nil {
+		w.pending = make(map[int64]chan rpcResp)
+	}
+	w.pending[id] = ch
+	w.pendingMu.Unlock()
+	defer func() {
+		w.pendingMu.Lock()
+		delete(w.pending, id)
+		w.pendingMu.Unlock()
+	}()
+
+	msg := map[string]interface{}{
+		"rpc": map[string]interface{}{"method": method, "data": data},
+		"id":  id,
+	}
+	if err := w.writeJSON(msg); err != nil {
+		return nil, err
+	}
+	select {
+	case r := <-ch:
+		return r.data, r.err
+	case <-w.ctx:
+		return nil, fmt.Errorf("closed")
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("rpc %s timeout (id %d)", method, id)
+	}
+}
+
+// clearPending fails every in-flight RPC call (connection reset); called when
+// the active websocket goes away or a fresh one is installed, so senders never
+// wait out the timeout on a reply that can no longer arrive.
+func (w *cupsWS) clearPending(reason error) {
+	w.pendingMu.Lock()
+	for id, ch := range w.pending {
+		select {
+		case ch <- rpcResp{err: reason}:
+		default:
+		}
+		delete(w.pending, id)
+	}
+	w.pendingMu.Unlock()
+}
 
 func (w *cupsWS) writeRaw(data []byte) error {
 	w.writeMu.Lock()
@@ -374,10 +498,12 @@ func (w *cupsWS) connectAndServe() error {
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
+	w.clearPending(errWSReset)
 	w.writeMu.Lock()
 	w.conn = conn
 	w.writeMu.Unlock()
 	defer func() {
+		w.clearPending(errWSReset)
 		w.writeMu.Lock()
 		w.conn = nil
 		w.writeMu.Unlock()
@@ -402,6 +528,13 @@ func (w *cupsWS) connectAndServe() error {
 	}
 	conn.SetReadDeadline(time.Now().Add(w.config.WSReadTimeout))
 	if _, _, err := conn.ReadMessage(); err != nil {
+		return err
+	}
+
+	// The data channel is diff-based: every change_code must apply against the
+	// exact current room document, so fetch the baseline (code + version) the
+	// way the real browser client does on "subscribed" before serving sends.
+	if err := w.fetchBaselineInline(conn); err != nil {
 		return err
 	}
 	w.connected.Store(true)
@@ -456,6 +589,12 @@ func (w *cupsWS) sendLoop() {
 	}
 	defer timer.Stop()
 
+	// Effective per-batch byte gate: the code document can only take so much.
+	maxBytes := w.config.BatchMaxBytes
+	if w.config.MaxCodeBytesPerBatch > 0 && (maxBytes <= 0 || w.config.MaxCodeBytesPerBatch < maxBytes) {
+		maxBytes = w.config.MaxCodeBytesPerBatch
+	}
+
 	flush := func() {
 		if len(batch) == 0 {
 			return
@@ -486,7 +625,7 @@ func (w *cupsWS) sendLoop() {
 			}
 			batch = append(batch, pkt)
 			totalBytes += len(pkt)
-			if len(batch) >= w.config.BatchMaxPackets || totalBytes >= w.config.BatchMaxBytes {
+			if len(batch) >= w.config.BatchMaxPackets || totalBytes >= maxBytes {
 				if !timer.Stop() {
 					select {
 					case <-timer.C:
@@ -503,108 +642,563 @@ func (w *cupsWS) sendLoop() {
 	}
 }
 
+// sendBatch smuggles the batch into the room's shared code document: our block
+// (at the document tail) is replaced with the base64 of the length-prefixed
+// batch framing, and the resulting unified diff is sent via the
+// shared_editor_change_code RPC. The server applies the diff only if its
+// context lines match the stored text, so a 400 means our baseline went stale
+// under a concurrent peer edit: refetch room_info and recompute (bounded).
+// Packets are never fragmented across calls — one batch either lands whole or
+// is retried/dropped, so the peer never sees a torn framing stream.
 func (w *cupsWS) sendBatch(batch [][]byte) error {
-	var buf bytes.Buffer
-	var hdr [2]byte
-	totalRaw := 0
-	for _, p := range batch {
-		binary.BigEndian.PutUint16(hdr[:], uint16(len(p)))
-		buf.Write(hdr[:])
-		buf.Write(p)
-		totalRaw += len(p)
-	}
-	col := base64.RawStdEncoding.EncodeToString(buf.Bytes())
+	payload, totalRaw := framePackets(batch)
+	col := base64.RawStdEncoding.EncodeToString(payload)
 
+	var lastErr error
+	for attempt := 1; attempt <= maxChangeCodeAttempts; attempt++ {
+		select {
+		case <-w.ctx:
+			return fmt.Errorf("closed")
+		default:
+		}
+
+		w.codeMu.Lock()
+		base := w.serverCode
+		w.codeMu.Unlock()
+		newCode := upsertBlock(base, w.side, w.roomIdx, col)
+		diff := makeDiff(base, newCode)
+
+		data := map[string]interface{}{
+			"diff": diff,
+			"room": w.auth.roomUUID,
+			"user": w.auth.userUUID,
+		}
+		resp, err := w.callRPC("shared_editor_change_code", data, changeRPCTimeout)
+		if err == nil {
+			w.applyChangeSuccess(base, newCode, resp)
+			w.stats.packetsSent.Add(uint64(len(batch)))
+			w.stats.bytesSent.Add(uint64(totalRaw))
+			w.stats.batchesSent.Add(1)
+			if len(newCode) > warnCodeDocBytes {
+				// We own only our block, and every send rewrites it in full,
+				// so an oversized document self-heals on the next batch; the
+				// log just names the culprit size.
+				utils.Debugf("[CUPS] room %s code document is %d bytes after our write", w.auth.roomUUID, len(newCode))
+			}
+			return nil
+		}
+		lastErr = err
+		utils.Debugf("[CUPS] change_code (%s) attempt %d/%d rejected: %v", w.auth.roomUUID, attempt, maxChangeCodeAttempts, err)
+		if rerr := w.refreshBaseline(); rerr != nil {
+			utils.Debugf("[CUPS] baseline refresh (%s): %v", w.auth.roomUUID, rerr)
+		}
+	}
+	return fmt.Errorf("change_code rejected after %d attempts: %w", maxChangeCodeAttempts, lastErr)
+}
+
+// applyChangeSuccess promotes the write into the baseline. If the read loop
+// already adopted a newer full document from a push (serverCode moved past our
+// snapshot), that copy is authoritative and we keep it.
+func (w *cupsWS) applyChangeSuccess(base, newCode string, resp json.RawMessage) {
+	var d struct {
+		Code    *string  `json:"code"`
+		Version *float64 `json:"version"`
+	}
+	if len(resp) > 0 {
+		_ = json.Unmarshal(resp, &d)
+	}
+	w.codeMu.Lock()
+	if w.serverCode == base {
+		if d.Code != nil {
+			w.serverCode = *d.Code
+		} else {
+			w.serverCode = newCode
+		}
+		if d.Version != nil && int64(*d.Version) > w.codeVersion {
+			w.codeVersion = int64(*d.Version)
+		}
+	}
+	w.codeMu.Unlock()
+}
+
+// refreshBaseline refetches the room document over the pending-RPC machinery
+// (safe from the send goroutine; it does NOT touch the read-loop-owned dedupe
+// state, so a peer payload we missed while stale is still delivered when its
+// push (or any later one) arrives).
+func (w *cupsWS) refreshBaseline() error {
+	data, err := w.callRPC("shared_editor_room_info", map[string]interface{}{"room": w.auth.roomUUID}, changeRPCTimeout)
+	if err != nil {
+		return err
+	}
+	var info struct {
+		Code    *string  `json:"code"`
+		Version *float64 `json:"version"`
+	}
+	if err := json.Unmarshal(data, &info); err != nil {
+		return fmt.Errorf("room_info decode: %w", err)
+	}
+	if info.Code == nil {
+		return fmt.Errorf("room_info: no code in reply")
+	}
+	w.codeMu.Lock()
+	w.serverCode = *info.Code
+	if info.Version != nil {
+		w.codeVersion = int64(*info.Version)
+	}
+	w.codeMu.Unlock()
+	utils.Debugf("[CUPS] baseline refreshed (%s): %d bytes", w.auth.roomUUID, len(*info.Code))
+	return nil
+}
+
+// wsFrame is the Centrifugo envelope: RPC replies carry "id" (correlated with
+// our call) plus "rpc"/"error"; server pushes carry "push".
+type wsFrame struct {
+	ID  *int64 `json:"id"`
+	RPC *struct {
+		Data json.RawMessage `json:"data"`
+	} `json:"rpc"`
+	Error *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+	Push json.RawMessage `json:"push"`
+}
+
+// fetchBaselineInline asks shared_editor_room_info for the current document
+// right after subscribe, reading straight off the socket (the read loop is not
+// running yet). Frames that are not our reply — e.g. a peer's code_update that
+// lands first — are served through the normal path. Runs on the read-loop
+// goroutine, so seeding the dedupe state from the fresh baseline is safe.
+func (w *cupsWS) fetchBaselineInline(conn *websocket.Conn) error {
+	id := w.nextID()
 	msg := map[string]interface{}{
 		"rpc": map[string]interface{}{
-			"method": "shared_editor_change_cursors",
-			"data": map[string]interface{}{
-				"cursors": []map[string]interface{}{{"row": 0, "column": col}},
-				"ranges":  []interface{}{},
-				"room":    w.auth.roomUUID,
-				"user":    w.auth.userUUID,
-			},
+			"method": "shared_editor_room_info",
+			"data":   map[string]interface{}{"room": w.auth.roomUUID},
 		},
-		"id": w.nextID(),
+		"id": id,
 	}
 	if err := w.writeJSON(msg); err != nil {
 		return err
 	}
-	w.stats.packetsSent.Add(uint64(len(batch)))
-	w.stats.bytesSent.Add(uint64(totalRaw))
-	w.stats.batchesSent.Add(1)
+	for {
+		select {
+		case <-w.ctx:
+			return fmt.Errorf("closed")
+		default:
+		}
+		conn.SetReadDeadline(time.Now().Add(w.config.WSReadTimeout))
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			return err
+		}
+		var fr wsFrame
+		if err := json.Unmarshal(raw, &fr); err != nil {
+			continue
+		}
+		if fr.ID != nil && *fr.ID == id {
+			if fr.Error != nil {
+				return fmt.Errorf("room_info: code=%d %s", fr.Error.Code, fr.Error.Message)
+			}
+			if fr.RPC == nil {
+				return fmt.Errorf("room_info: empty reply")
+			}
+			return w.applyRoomInfo(fr.RPC.Data)
+		}
+		w.handleDecoded(&fr)
+	}
+}
+
+// applyRoomInfo stores the baseline fetched on connect and seeds the peer-data
+// dedupe state from it. Read-loop goroutine only.
+func (w *cupsWS) applyRoomInfo(data json.RawMessage) error {
+	var info struct {
+		Code    *string  `json:"code"`
+		Version *float64 `json:"version"`
+	}
+	if err := json.Unmarshal(data, &info); err != nil {
+		return fmt.Errorf("room_info decode: %w", err)
+	}
+	if info.Code == nil {
+		return fmt.Errorf("room_info: no code in reply")
+	}
+	ver := int64(-1)
+	if info.Version != nil {
+		ver = int64(*info.Version)
+	}
+	w.codeMu.Lock()
+	w.serverCode = *info.Code
+	w.codeVersion = ver
+	w.codeMu.Unlock()
+
+	// Anything the peer had already written was delivered in an earlier
+	// session (or is stale); mark it as seen so the next push only counts as
+	// traffic when the peer block actually changes.
+	peer := decodeBlockPayload(extractBlockSide(strings.Split(*info.Code, "\n"), w.peerSide))
+	w.lastPeerHash = hashBytes(peer)
+	w.havePeerState = true
+	if ver > w.observedVer {
+		w.observedVer = ver
+	}
+	utils.Debugf("[CUPS] baseline (%s): %d bytes, version %d", w.auth.roomUUID, len(*info.Code), ver)
 	return nil
 }
 
 func (w *cupsWS) handleMessage(raw []byte) {
+	// Centrifugo low-level ping: bare "{}" frame, reply verbatim.
 	if len(raw) == 2 && raw[0] == '{' && raw[1] == '}' {
 		_ = w.writeRaw([]byte("{}"))
 		return
 	}
-	var obj map[string]interface{}
-	if err := json.Unmarshal(raw, &obj); err != nil {
+	var fr wsFrame
+	if err := json.Unmarshal(raw, &fr); err != nil {
 		return
 	}
-	push, ok := obj["push"].(map[string]interface{})
-	if !ok {
-		return
-	}
-	pub, _ := push["pub"].(map[string]interface{})
-	data, _ := pub["data"].(map[string]interface{})
-	if data == nil {
-		return
-	}
-	if t, _ := data["type"].(string); t != "cursors_update" {
-		return
-	}
-	payload, _ := data["payload"].(map[string]interface{})
-	if payload == nil {
-		return
-	}
-	if uuid, _ := payload["user_uuid"].(string); uuid == w.auth.userUUID {
-		return
-	}
-	cursors, _ := payload["cursors"].([]interface{})
-	if len(cursors) == 0 {
-		return
-	}
-	c0, _ := cursors[0].(map[string]interface{})
-	if c0 == nil {
-		return
-	}
-	colStr, ok := c0["column"].(string)
-	if !ok || colStr == "" {
-		return
-	}
-	decoded, err := base64.RawStdEncoding.DecodeString(colStr)
-	if err != nil {
-		decoded, err = base64.StdEncoding.DecodeString(colStr)
-		if err != nil {
-			return
+	w.handleDecoded(&fr)
+}
+
+func (w *cupsWS) handleDecoded(fr *wsFrame) {
+	if fr.ID != nil {
+		id := *fr.ID
+		w.pendingMu.Lock()
+		ch, ok := w.pending[id]
+		if ok {
+			delete(w.pending, id)
 		}
+		w.pendingMu.Unlock()
+		if ok {
+			switch {
+			case fr.Error != nil:
+				ch <- rpcResp{err: fmt.Errorf("server rpc error %d: %s", fr.Error.Code, fr.Error.Message)}
+			case fr.RPC != nil:
+				ch <- rpcResp{data: fr.RPC.Data}
+			default:
+				ch <- rpcResp{err: fmt.Errorf("empty rpc reply for id %d", id)}
+			}
+		}
+	}
+	if fr.Push == nil {
+		return
+	}
+	var push struct {
+		Channel string `json:"channel"`
+		Pub     struct {
+			Data struct {
+				Type    string          `json:"type"`
+				Payload json.RawMessage `json:"payload"`
+			} `json:"data"`
+			Offset uint64 `json:"offset"`
+		} `json:"pub"`
+	}
+	if err := json.Unmarshal(fr.Push, &push); err != nil {
+		return
+	}
+	switch push.Pub.Data.Type {
+	case "code_update":
+		w.handleCodeUpdate(push.Pub.Data.Payload)
+	}
+}
+
+// handleCodeUpdate processes the {"type":"code_update","payload":{uuid,code,
+// version}} push. The payload carries the FULL room document: it keeps our
+// diff baseline fresh, and our side's packets are read from the peer's block.
+func (w *cupsWS) handleCodeUpdate(payloadRaw json.RawMessage) {
+	var p struct {
+		UUID    string   `json:"uuid"`
+		Code    *string  `json:"code"`
+		Version *float64 `json:"version"`
+	}
+	if err := json.Unmarshal(payloadRaw, &p); err != nil || p.Code == nil {
+		return
+	}
+	code := *p.Code
+	haveVer := p.Version != nil
+	ver := int64(-1)
+	if haveVer {
+		ver = int64(*p.Version)
 	}
 
-	count := 0
-	total := 0
-	for len(decoded) >= 2 {
-		ln := int(binary.BigEndian.Uint16(decoded[:2]))
-		decoded = decoded[2:]
-		if ln == 0 || len(decoded) < ln {
-			break
+	// Adopt the full document as baseline whenever it is newer than what we
+	// hold (a push we have not seen must never roll the version back).
+	w.codeMu.Lock()
+	if (haveVer && ver > w.codeVersion) || (!haveVer && w.codeVersion < 0) {
+		w.serverCode = code
+		if haveVer {
+			w.codeVersion = ver
 		}
-		pkt := decoded[:ln]
-		decoded = decoded[ln:]
-		if w.onData != nil {
-			w.onData(pkt)
-		}
-		count++
-		total += ln
 	}
+	w.codeMu.Unlock()
+
+	if haveVer && w.havePeerState && ver <= w.observedVer {
+		return // stale pub (resubscribe replay / duplicate delivery)
+	}
+	peerBytes := decodeBlockPayload(extractBlockSide(strings.Split(code, "\n"), w.peerSide))
+	h := hashBytes(peerBytes)
+	if w.havePeerState && h == w.lastPeerHash {
+		// Peer block unchanged: this is our own edit (or a filler push)
+		// echoing back. Track the version so late replays stay filtered.
+		if haveVer && ver > w.observedVer {
+			w.observedVer = ver
+		}
+		return
+	}
+	count, total := splitPackets(peerBytes, w.onData)
+	if haveVer && ver > w.observedVer {
+		w.observedVer = ver
+	}
+	w.lastPeerHash = h
+	w.havePeerState = true
 	if count > 0 {
 		w.stats.packetsRecv.Add(uint64(count))
 		w.stats.bytesRecv.Add(uint64(total))
 		w.stats.batchesRecv.Add(1)
 	}
+}
+
+func hashBytes(b []byte) uint64 {
+	h := fnv.New64a()
+	h.Write(b)
+	return h.Sum64()
+}
+
+// ---- code channel: blocks, diff, framing ----
+
+const (
+	// diffContextLines is the number of context lines a unified-diff hunk
+	// carries around the change (git default). Our edits are always one
+	// contiguous tail replacement, so exactly one hunk is produced.
+	diffContextLines = 3
+	// b64LineChunk keeps base64 payload lines short so the diff stays
+	// line-granular and hunk bodies remain small.
+	b64LineChunk = 200
+	// maxChangeCodeAttempts bounds the stale-baseline retry loop.
+	maxChangeCodeAttempts = 3
+	// changeRPCTimeout bounds one RPC round-trip on the send path.
+	changeRPCTimeout = 10 * time.Second
+	// warnCodeDocBytes only triggers a debug log; our block always replaces
+	// itself wholesale, so oversized documents self-heal.
+	warnCodeDocBytes = 64 * 1024
+)
+
+// reBlockMarker matches our fences, e.g. "//OCX-2-BEGIN". The side letter
+// ("X" exit / "Y" client) is what distinguishes ours from the peer's.
+var reBlockMarker = regexp.MustCompile(`^//OC([XY])-(\d+)-(BEGIN|END)$`)
+
+func blockMarker(side string, idx int, kind string) string {
+	return fmt.Sprintf("//OC%s-%d-%s", side, idx, kind)
+}
+
+func parseBlockMarker(line string) (side string, idx int, kind string, ok bool) {
+	m := reBlockMarker.FindStringSubmatch(line)
+	if m == nil {
+		return "", 0, "", false
+	}
+	i, _ := strconv.Atoi(m[2])
+	return m[1], i, m[3], true
+}
+
+// removeBlockSide drops every block fenced for the given side (marker lines
+// inclusive). Everything else — template text, the peer's block — passes
+// through byte-identical, which makes our diff hunks never touch foreign
+// lines. An unterminated own block at EOF is ours too and gets dropped whole.
+func removeBlockSide(lines []string, side string) []string {
+	out := make([]string, 0, len(lines))
+	skip := false
+	for _, ln := range lines {
+		if s, _, kind, ok := parseBlockMarker(ln); ok && s == side {
+			if kind == "BEGIN" {
+				skip = true
+				continue
+			}
+			if kind == "END" {
+				skip = false
+				continue
+			}
+		}
+		if skip {
+			continue
+		}
+		out = append(out, ln)
+	}
+	return out
+}
+
+// extractBlockSide returns the concatenated body of the first complete block
+// fenced for the given side, or "" when absent/unterminated.
+func extractBlockSide(lines []string, side string) string {
+	var sb strings.Builder
+	inBlock := false
+	for _, ln := range lines {
+		if s, _, kind, ok := parseBlockMarker(ln); ok && s == side {
+			if kind == "BEGIN" {
+				if inBlock {
+					sb.Reset() // unterminated earlier block: newest wins
+				}
+				inBlock = true
+				continue
+			}
+			if kind == "END" {
+				if inBlock {
+					return sb.String()
+				}
+				continue
+			}
+		}
+		if inBlock {
+			sb.WriteString(strings.Join(strings.Fields(ln), ""))
+		}
+	}
+	return ""
+}
+
+// buildBlockLines fences the base64 payload into short lines.
+func buildBlockLines(side string, idx int, payloadB64 string) []string {
+	lines := []string{blockMarker(side, idx, "BEGIN")}
+	for i := 0; i < len(payloadB64); i += b64LineChunk {
+		e := i + b64LineChunk
+		if e > len(payloadB64) {
+			e = len(payloadB64)
+		}
+		lines = append(lines, payloadB64[i:e])
+	}
+	lines = append(lines, blockMarker(side, idx, "END"))
+	return lines
+}
+
+// upsertBlock replaces our fenced block in the document, appending one at the
+// tail when absent. Idempotent: any stale copies of our block (from before a
+// reconnect) are stripped first, so the result always has exactly one.
+func upsertBlock(code string, side string, idx int, payloadB64 string) string {
+	lines := strings.Split(code, "\n")
+	rest := removeBlockSide(lines, side)
+	out := make([]string, 0, len(rest)+8)
+	out = append(out, rest...)
+	out = append(out, buildBlockLines(side, idx, payloadB64)...)
+	return strings.Join(out, "\n")
+}
+
+// decodeBlockPayload decodes the concatenated base64 body written by our own
+// encoder (unpadded first, padded as fallback).
+func decodeBlockPayload(b64 string) []byte {
+	if b64 == "" {
+		return nil
+	}
+	raw, err := base64.RawStdEncoding.DecodeString(b64)
+	if err != nil {
+		raw2, err2 := base64.StdEncoding.DecodeString(b64)
+		if err2 != nil {
+			return nil
+		}
+		raw = raw2
+	}
+	return raw
+}
+
+// framePackets / splitPackets: the wire framing inside a block — one
+// 2-byte big-endian length per packet (identical to the old cursor channel).
+func framePackets(batch [][]byte) ([]byte, int) {
+	var buf bytes.Buffer
+	var hdr [2]byte
+	total := 0
+	for _, p := range batch {
+		binary.BigEndian.PutUint16(hdr[:], uint16(len(p)))
+		buf.Write(hdr[:])
+		buf.Write(p)
+		total += len(p)
+	}
+	return buf.Bytes(), total
+}
+
+func splitPackets(raw []byte, onData func([]byte)) (int, int) {
+	count, total := 0, 0
+	for len(raw) >= 2 {
+		ln := int(binary.BigEndian.Uint16(raw[:2]))
+		raw = raw[2:]
+		if ln == 0 || len(raw) < ln {
+			break
+		}
+		pkt := raw[:ln]
+		raw = raw[ln:]
+		if onData != nil {
+			onData(pkt)
+		}
+		count++
+		total += ln
+	}
+	return count, total
+}
+
+// jsEncode percent-encodes one diff line with JS encodeURIComponent semantics:
+// alphanumerics and -_.!~*'() stay literal, every other byte becomes %XX with
+// upper-hex (UTF-8 bytes for non-ASCII, exactly as the browser sends them).
+func jsEncode(s string) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '-', c == '_', c == '.', c == '!', c == '~', c == '*',
+			c == '\'', c == '(', c == ')':
+			b.WriteByte(c)
+		default:
+			b.WriteByte('%')
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&0x0f])
+		}
+	}
+	return b.String()
+}
+
+// makeDiff emits one unified-diff hunk turning oldText into newText. We only
+// ever replace our own contiguous tail block, so a common-prefix/suffix scan
+// yields the single changed region exactly — hunk headers are exact by
+// construction: "@@ -start,lcs +start,lcs @@" with up to diffContextLines
+// context lines on each side. Line contents are percent-encoded like the real
+// client does; the "\n" between encoded lines carries the document structure.
+func makeDiff(oldText, newText string) string {
+	o := strings.Split(oldText, "\n")
+	n := strings.Split(newText, "\n")
+	p := 0
+	for p < len(o) && p < len(n) && o[p] == n[p] {
+		p++
+	}
+	s := 0
+	for s < len(o)-p && s < len(n)-p && o[len(o)-1-s] == n[len(n)-1-s] {
+		s++
+	}
+	oStart, oEnd := p, len(o)-s // changed region in old [oStart, oEnd)
+	nStart, nEnd := p, len(n)-s // changed region in new [nStart, nEnd)
+
+	hStart := oStart - diffContextLines
+	if hStart < 0 {
+		hStart = 0
+	}
+	hEnd := oEnd + diffContextLines
+	if hEnd > len(o) {
+		hEnd = len(o)
+	}
+	// The new-side hunk starts at the same line (everything before oStart is
+	// byte-identical on both sides) and spans the changed lines plus the same
+	// number of trailing context lines that follow oEnd in the old text.
+	nHunkEnd := nEnd + (hEnd - oEnd)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "@@ -%d,%d +%d,%d @@\n", hStart+1, hEnd-hStart, hStart+1, nHunkEnd-hStart)
+	for i := hStart; i < oStart; i++ {
+		b.WriteString(" " + jsEncode(o[i]) + "\n")
+	}
+	for i := oStart; i < oEnd; i++ {
+		b.WriteString("-" + jsEncode(o[i]) + "\n")
+	}
+	for i := nStart; i < nEnd; i++ {
+		b.WriteString("+" + jsEncode(n[i]) + "\n")
+	}
+	for i := oEnd; i < hEnd; i++ {
+		b.WriteString(" " + jsEncode(o[i]) + "\n")
+	}
+	return b.String()
 }
 
 func (w *cupsWS) Send(data []byte) error {
@@ -669,7 +1263,7 @@ func NewCupsonlineTransport(rawURL string, cfg transport.TransportConfig, isClie
 	}
 
 	if !isClient {
-		t.baseURL = baseRoomURL
+		t.baseURL = roomBaseURL
 		return t
 	}
 
@@ -697,7 +1291,7 @@ func NewCupsonlineTransport(rawURL string, cfg transport.TransportConfig, isClie
 	}
 	t.urls = make([]string, 0, len(ids))
 	for _, id := range ids {
-		t.urls = append(t.urls, baseRoomURL+"?room="+id)
+		t.urls = append(t.urls, roomBaseURL+"?room="+id)
 	}
 	utils.Debugf("[CUPS] client mode: %d rooms from base64", len(t.urls))
 	return t
@@ -739,14 +1333,25 @@ func (t *CupsonlineTransport) Start() error {
 
 	t.auths = auths
 
+	side := "X"
+	peerSide := "Y"
+	if t.isClient {
+		side = "Y"
+		peerSide = "X"
+	}
 	for i, a := range auths {
 		cs := &channelStats{idx: i, roomUUID: a.roomUUID}
 		ws := &cupsWS{
-			auth:      a,
-			config:    t.config,
-			ctx:       make(chan struct{}),
-			sendQueue: make(chan []byte, t.config.SendQueueSize),
-			stats:     cs,
+			auth:        a,
+			config:      t.config,
+			ctx:         make(chan struct{}),
+			sendQueue:   make(chan []byte, t.config.SendQueueSize),
+			stats:       cs,
+			side:        side,
+			peerSide:    peerSide,
+			roomIdx:     i,
+			codeVersion: -1,
+			pending:     make(map[int64]chan rpcResp),
 		}
 		ws.onData = t.handleIncoming
 		t.wss = append(t.wss, ws)
@@ -1002,7 +1607,7 @@ func (t *CupsonlineTransport) jar() *cookiejar.Jar {
 // FetchCookies returns a snapshot of the transport's current cookie jar as
 // name -> value.
 func (t *CupsonlineTransport) FetchCookies() (map[string]string, error) {
-	u, err := url.Parse(baseRoomURL)
+	u, err := url.Parse(roomBaseURL)
 	if err != nil {
 		return nil, err
 	}
@@ -1019,7 +1624,7 @@ func (t *CupsonlineTransport) ApplyCookies(values map[string]string) error {
 	if len(values) == 0 {
 		return nil
 	}
-	u, _ := url.Parse(baseRoomURL)
+	u, _ := url.Parse(roomBaseURL)
 	jar, _ := cookiejar.New(nil)
 	cookies := make([]*http.Cookie, 0, len(values))
 	for k, v := range values {
