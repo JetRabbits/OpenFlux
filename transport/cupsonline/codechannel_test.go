@@ -5,9 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/JetRabbits/OpenFlux/transport"
 )
@@ -42,6 +44,29 @@ func waitWSConnected(t *testing.T, tr *CupsonlineTransport, label string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("%s: ws channels never became connected", label)
+}
+
+// applyEdit runs a buildBlockEdit patch through the reference server-side
+// apply, asserting the transport's expectation matches what the server dialect
+// actually produces (the fake's no-op path must never trigger for a patch
+// computed from the true current document).
+func applyEdit(t *testing.T, doc, side string, idx int, payloadB64 string) string {
+	t.Helper()
+	newDoc, diff, changed := buildBlockEdit(doc, side, idx, payloadB64)
+	if !changed {
+		t.Fatalf("edit reported unchanged for a document that needs the write")
+	}
+	got, applied, err := fakeApplyDiff(doc, diff)
+	if err != nil {
+		t.Fatalf("patch rejected as malformed: %v\n--- patch ---\n%s", err, diff)
+	}
+	if !applied {
+		t.Fatalf("patch silently no-oped against its own base doc:\n--- patch ---\n%s", diff)
+	}
+	if got != newDoc {
+		t.Fatalf("applied result != intended:\n got %q\nwant %q", got, newDoc)
+	}
+	return newDoc
 }
 
 // (a) Full-stack round trip: an exit transport (creates its room on the fake
@@ -107,9 +132,9 @@ func TestTwoPeersRoundTrip(t *testing.T) {
 				_ = clientTr.Send(pktB)
 			}
 		case <-deadline:
-			applied, rejected := f.stats(ids[0])
-			t.Fatalf("round trip incomplete: exit->client=%v client->exit=%v (server applied=%d rejected=%d, exit stats %+v, client stats %+v)",
-				gotA, gotB, applied, rejected, exitTr.Stats(), clientTr.Stats())
+			applied, rejected, noop := f.stats(ids[0])
+			t.Fatalf("round trip incomplete: exit->client=%v client->exit=%v (server applied=%d rejected=%d noop=%d, exit stats %+v, client stats %+v)",
+				gotA, gotB, applied, rejected, noop, exitTr.Stats(), clientTr.Stats())
 		}
 	}
 
@@ -139,10 +164,12 @@ func waitForStats(t *testing.T, tr *CupsonlineTransport, minSent, minRecv uint64
 	}
 }
 
-// (b) Stale-baseline recovery: a server-side edit that never broadcast a push
-// strands the exit's baseline; the first change_code must hit the 400, refetch
-// room_info and land the packet on the retry.
-func TestStaleBaseline400Recovery(t *testing.T) {
+// (b) Stale-baseline recovery the LIVE way: a server-side edit that never
+// broadcast a push strands the exit's baseline; the first change_code is
+// SILENTLY NO-OPED (version bump, doc untouched — no 400!), and the transport
+// must notice via the authoritative code in the RPC reply, refetch room_info
+// and land the packet on the retry.
+func TestStaleBaselineRecovery(t *testing.T) {
 	f := newFakeCups(t)
 	f.pointBaseAt(t)
 
@@ -167,8 +194,9 @@ func TestStaleBaseline400Recovery(t *testing.T) {
 	waitWSConnected(t, exitTr, "exit")
 	waitWSConnected(t, clientTr, "client")
 
-	// Out-of-band edit that replaces a line inside every diff's trailing
-	// context — the stored document no longer matches what exit believes.
+	// Out-of-band edit touching the rune region where the exit's first append
+	// patch places its context — the stored document no longer matches what
+	// exit believes.
 	f.silentMutate(ids[0], func(code string) string {
 		lines := strings.Split(code, "\n")
 		for i := len(lines) - 1; i >= 0; i-- {
@@ -195,19 +223,19 @@ func TestStaleBaseline400Recovery(t *testing.T) {
 		case <-tick.C:
 			_ = exitTr.Send(pkt)
 		case <-deadline:
-			_, rejected := f.stats(ids[0])
-			t.Fatalf("packet never arrived; rejections so far=%d, exit stats %+v", rejected, exitTr.Stats())
+			_, rejected, noop := f.stats(ids[0])
+			t.Fatalf("packet never arrived; noop=%d rejected=%d, exit stats %+v", noop, rejected, exitTr.Stats())
 		}
 	}
 
-	_, rejected := f.stats(ids[0])
-	if rejected == 0 {
-		t.Fatal("expected at least one server-side 400 (stale diff) that the transport recovered from")
+	_, _, noop := f.stats(ids[0])
+	if noop == 0 {
+		t.Fatal("expected at least one silent server-side no-op that the transport recovered from")
 	}
 
-	// The sender adopts its own write (applyChangeSuccess / its own echo push)
-	// in its own goroutines a moment after the peer sees the packet; poll the
-	// baseline until it converges.
+	// The sender adopts its own write (authoritative reply / its own echo
+	// push) in its own goroutines a moment after the peer sees the packet;
+	// poll the baseline until it converges.
 	w := exitTr.wss[0]
 	deadlineBase := time.Now().Add(10 * time.Second)
 	var code string
@@ -231,29 +259,18 @@ func mustPack(ids []string) string {
 	return "?rooms=" + base64.RawURLEncoding.EncodeToString(raw)
 }
 
-// (c) Block replacement idempotency through the real diff/apply path: our
+// (c) Block replacement idempotency through the real patch/apply path: our
 // block is rewritten repeatedly, the template and the peer's block stay
-// byte-identical, and every diff the generator emits applies cleanly.
+// byte-identical, and every patch the builder emits applies for real.
 func TestBlockUpsertIdempotentPreservesTemplateAndPeer(t *testing.T) {
 	peerB64 := b64Frame([]byte("peer-payload-that-must-survive-every-rewrite"))
-	base := fakeTemplate() + strings.Join(buildBlockLines("Y", 0, peerB64), "\n")
+	base := applyEdit(t, fakeTemplate(), "Y", 0, peerB64)
 
 	p1 := b64Frame([]byte("first payload"))
 	p2 := b64Frame([]byte("second payload"), []byte("and more"))
 
-	apply := func(from, to string) string {
-		got, err := fakeApplyDiff(from, makeDiff(from, to))
-		if err != nil {
-			t.Fatalf("generated diff does not apply: %v\n--- diff ---\n%s", err, makeDiff(from, to))
-		}
-		if got != to {
-			t.Fatalf("applied result != intended newCode:\n%q\n%q", got, to)
-		}
-		return got
-	}
-
-	c1 := apply(base, upsertBlock(base, "X", 0, p1))
-	c2 := apply(c1, upsertBlock(c1, "X", 0, p2))
+	c1 := applyEdit(t, base, "X", 0, p1)
+	c2 := applyEdit(t, c1, "X", 0, p2)
 
 	if n := strings.Count(c2, "//OCX-0-BEGIN") + strings.Count(c2, "//OCX-0-END"); n != 2 {
 		t.Fatalf("our block markers must appear exactly once each, got %d total", n)
@@ -268,17 +285,19 @@ func TestBlockUpsertIdempotentPreservesTemplateAndPeer(t *testing.T) {
 	if got := extractBlockSide(lines, "Y"); got != peerB64 {
 		t.Fatal("peer block was disturbed by our rewrite")
 	}
-	// Template preserved line-for-line: removing both blocks must rebuild the
-	// template (the template's trailing "\n" is just the separator that joins
-	// it to the peer block, so it is not part of any line).
+	// Template preserved line-for-line: removing both blocks rebuilds the
+	// template exactly — the template's own trailing newline became the
+	// separator above our block, and our block's closing newline survives as
+	// the document's final line break.
 	ours := removeBlockSide(lines, "X")
 	theirs := removeBlockSide(ours, "Y")
-	if got := strings.Join(theirs, "\n"); got != strings.TrimSuffix(fakeTemplate(), "\n") {
+	if got := strings.Join(theirs, "\n"); got != fakeTemplate() {
 		t.Fatalf("template text was disturbed:\n%q", got)
 	}
 
-	// Reconnect-style third round: same block, another payload, still exactly one.
-	c3 := apply(c2, upsertBlock(c2, "X", 0, p1))
+	// Reconnect-style third round: same block, another payload, still exactly
+	// one block.
+	c3 := applyEdit(t, c2, "X", 0, p1)
 	if n := strings.Count(c3, "//OCX-0-BEGIN"); n != 1 {
 		t.Fatalf("block count after 3rd rewrite = %d, want 1", n)
 	}
@@ -287,6 +306,38 @@ func TestBlockUpsertIdempotentPreservesTemplateAndPeer(t *testing.T) {
 	}
 	if got := extractBlockSide(strings.Split(c3, "\n"), "Y"); got != peerB64 {
 		t.Fatal("peer block lost during 3rd rewrite")
+	}
+
+	// No-op detection: rewriting the SAME payload must report unchanged.
+	if _, _, changed := buildBlockEdit(c3, "X", 0, p1); changed {
+		t.Fatal("identical payload rewrite must be a no-op")
+	}
+}
+
+// (c2) A stale duplicate of OUR block (only a fuzzy server apply could create
+// it) collapses back into exactly one block through the contiguous-run path.
+func TestBlockDuplicateCollapse(t *testing.T) {
+	base := applyEdit(t, fakeTemplate(), "Y", 0, b64Frame([]byte("peer-data")))
+	c1 := applyEdit(t, base, "X", 0, b64Frame([]byte("dup-a")))
+
+	// Fabricate two ADJACENT copies of our block (c1 already ends with the
+	// first block's closing newline, so the second starts immediately after:
+	// exactly the layout the collapse path claims to handle).
+	dup := c1 + blockText("X", 0, chunkLines(b64Frame([]byte("dup-b")))) + "\n"
+	blocks := findBlocks(dup, "X")
+	if len(blocks) != 2 {
+		t.Fatalf("findBlocks found %d, want 2", len(blocks))
+	}
+
+	c2 := applyEdit(t, dup, "X", 0, b64Frame([]byte("after-collapse")))
+	if n := strings.Count(c2, "//OCX-0-BEGIN"); n != 1 {
+		t.Fatalf("collapse left %d blocks, want 1", n)
+	}
+	if got := extractBlockSide(strings.Split(c2, "\n"), "X"); got != b64Frame([]byte("after-collapse")) {
+		t.Fatal("collapse payload wrong")
+	}
+	if got := extractBlockSide(strings.Split(c2, "\n"), "Y"); got != b64Frame([]byte("peer-data")) {
+		t.Fatal("collapse disturbed the peer block")
 	}
 }
 
@@ -301,13 +352,13 @@ func TestFramingAcrossChunkLines(t *testing.T) {
 	}
 	col := base64.RawStdEncoding.EncodeToString(framed)
 
-	code := upsertBlock(fakeTemplate(), "X", 3, col)
+	code := applyEdit(t, fakeTemplate(), "X", 3, col)
 	lines := strings.Split(code, "\n")
 	inBlock := false
 	chunks := 0
 	for _, ln := range lines {
-		if _, _, kind, ok := parseBlockMarker(ln); ok {
-			inBlock = kind == "BEGIN"
+		if s, _, kind, ok := parseBlockMarker(ln); ok {
+			inBlock = s == "X" && kind == "BEGIN"
 			continue
 		}
 		if inBlock {
@@ -333,9 +384,13 @@ func TestFramingAcrossChunkLines(t *testing.T) {
 		t.Fatalf("split/join mismatch: n=%d tot=%d packets=%v", n, tot, recovered)
 	}
 
-	// The whole thing must still travel as one applying diff.
-	if got, err := fakeApplyDiff(fakeTemplate(), makeDiff(fakeTemplate(), code)); err != nil || got != code {
-		t.Fatalf("diff for chunked block: %v", err)
+	// A second oversized write must replace the first (multi-line → multi-line).
+	code2 := applyEdit(t, code, "X", 3, base64.RawStdEncoding.EncodeToString(func() []byte {
+		f2, _ := framePackets([][]byte{bytes.Repeat([]byte("Z"), 3000)})
+		return f2
+	}()))
+	if strings.Count(code2, "//OCX-3-BEGIN") != 1 {
+		t.Fatal("second oversized write must replace, not append")
 	}
 }
 
@@ -356,7 +411,7 @@ func TestCodeUpdateDedupeAndDelivery(t *testing.T) {
 		onData:      func(p []byte) { got = append(got, append([]byte(nil), p...)) },
 	}
 
-	base := fakeTemplate() + strings.Join(buildBlockLines("X", 0, b64Frame([]byte("pre-existing-peer-data"))), "\n")
+	base := applyEdit(t, fakeTemplate(), "X", 0, b64Frame([]byte("pre-existing-peer-data")))
 	info, _ := json.Marshal(map[string]interface{}{"uuid": "r", "code": base, "version": 7})
 	if err := w.applyRoomInfo(info); err != nil {
 		t.Fatalf("applyRoomInfo: %v", err)
@@ -381,7 +436,7 @@ func TestCodeUpdateDedupeAndDelivery(t *testing.T) {
 	}
 
 	// Peer's fresh payload: delivered.
-	withP2 := upsertBlock(base, "X", 0, b64Frame([]byte("P2-a"), []byte("P2-b")))
+	withP2 := applyEdit(t, base, "X", 0, b64Frame([]byte("P2-a"), []byte("P2-b")))
 	w.handleMessage(push(withP2, 9))
 	if len(got) != 2 || string(got[0]) != "P2-a" || string(got[1]) != "P2-b" {
 		t.Fatalf("peer payload delivery = %q, want [P2-a P2-b]", got)
@@ -395,14 +450,14 @@ func TestCodeUpdateDedupeAndDelivery(t *testing.T) {
 	}
 
 	// Our send echoes (our block changed, peer block same): silent.
-	own := upsertBlock(withP2, "Y", 0, b64Frame([]byte("our-data")))
+	own := applyEdit(t, withP2, "Y", 0, b64Frame([]byte("our-data")))
 	w.handleMessage(push(own, 10))
 	if len(got) != 2 {
 		t.Fatalf("our own echo leaked %d packets", len(got)-2)
 	}
 
 	// Peer payload again: delivered; baseline follows the newest document.
-	withP3 := upsertBlock(own, "X", 0, b64Frame([]byte("P3")))
+	withP3 := applyEdit(t, own, "X", 0, b64Frame([]byte("P3")))
 	w.handleMessage(push(withP3, 11))
 	if len(got) != 3 || string(got[2]) != "P3" {
 		t.Fatalf("second peer payload = %q, want [P2-a P2-b P3]", got)
@@ -445,7 +500,7 @@ func TestCodeUpdateDedupeWithoutVersion(t *testing.T) {
 		}})
 		return raw
 	}
-	withPeer := upsertBlock("template line\n", "X", 0, b64Frame([]byte("V1")))
+	withPeer := applyEdit(t, "template line\n", "X", 0, b64Frame([]byte("V1")))
 	w.handleMessage(pushNoVer(withPeer))
 	if len(got) != 1 || string(got[0]) != "V1" {
 		t.Fatalf("first push delivered %q", got)
@@ -465,6 +520,7 @@ func TestJsEncodeMatchesEncodeURIComponent(t *testing.T) {
 		{`{}":,`, "%7B%7D%22%3A%2C"},
 		{"%41", "%2541"},
 		{"tab\there", "tab%09here"},
+		{"nl\nnl", "nl%0Anl"},
 	} {
 		if got := jsEncode(tc.in); got != tc.want {
 			t.Errorf("jsEncode(%q) = %q, want %q", tc.in, got, tc.want)
@@ -472,50 +528,98 @@ func TestJsEncodeMatchesEncodeURIComponent(t *testing.T) {
 	}
 }
 
-func TestMakeDiffGolden(t *testing.T) {
-	// Pure append at EOF.
-	old := "alpha\nbeta\ngamma"
-	new_ := "alpha\nbeta\ngamma\n//OCX-0-BEGIN\nQUJDRA\n//OCX-0-END"
-	want := "@@ -1,3 +1,6 @@\n alpha\n beta\n gamma\n+%2F%2FOCX-0-BEGIN\n+QUJDRA\n+%2F%2FOCX-0-END\n"
-	if got := makeDiff(old, new_); got != want {
-		t.Fatalf("append hunk:\n got %q\nwant %q", got, want)
+// Byte-for-byte reproductions of the live frames captured 2026-10 (the ground
+// truth that killed the line-granular generator), plus the same dialect's
+// replace shape and the fake server's failure semantics.
+func TestMakeDiffLiveFrameGoldens(t *testing.T) {
+	// Frame 1 (APPEND): client "Y" block appended after "...yTest;\n\n".
+	// 1591 rune offset = end of a 1599-rune document minus the 8-rune context
+	// "yTest;\n\n"; old=8 (ctx+del), new=43 (ctx + 35-rune insertion).
+	doc1 := strings.Repeat("x", 1591) + "yTest;\n\n"
+	ins1 := "//OCY-1-BEGIN\nQUJDRA==\n//OCY-1-END\n"
+	want1 := "@@ -1591,8 +1591,43 @@\n yTest%3B%0A%0A\n+%2F%2FOCY-1-BEGIN%0AQUJDRA%3D%3D%0A%2F%2FOCY-1-END%0A\n"
+	got1 := makeDiff(1591, "yTest;\n\n", "", ins1)
+	if got1 != want1 {
+		t.Fatalf("append frame:\n got %q\nwant %q", got1, want1)
 	}
-	if got, err := fakeApplyDiff(old, want); err != nil || got != new_ {
-		t.Fatalf("golden hunk must apply: %v", err)
-	}
-
-	// Replacement in the middle, 3 context lines each side.
-	var o []string
-	for i := 0; i < 10; i++ {
-		o = append(o, string(rune('a'+i)))
-	}
-	n := append([]string{}, o...)
-	n[5], n[6] = "X", "Y"
-	got := makeDiff(strings.Join(o, "\n"), strings.Join(n, "\n"))
-	if !strings.HasPrefix(got, "@@ -3,8 +3,8 @@\n") {
-		t.Fatalf("middle hunk header wrong:\n%s", got)
-	}
-	if res, err := fakeApplyDiff(strings.Join(o, "\n"), got); err != nil || res != strings.Join(n, "\n") {
-		t.Fatalf("middle hunk must apply: %v", err)
+	if res, applied, err := fakeApplyDiff(doc1, got1); err != nil || !applied || res != doc1+ins1 {
+		t.Fatalf("append frame must apply: applied=%v err=%v", applied, err)
 	}
 
-	// Long documents: leading context must not exceed diffContextLines.
-	long := strings.Repeat("ctx\n", 50) + "oldline\n"
-	changed := strings.Repeat("ctx\n", 50) + "newline\n"
-	d := makeDiff(strings.TrimSuffix(long, "\n"), strings.TrimSuffix(changed, "\n"))
-	lines := strings.Split(strings.TrimSuffix(d, "\n"), "\n")
-	ctxBefore := 0
-	for _, ln := range lines[1:] {
-		if strings.HasPrefix(ln, " ") {
-			ctxBefore++
-		} else {
-			break
-		}
+	// Frame 2 (DELETE): remove "RkZGRg==" sitting right after context
+	// "QUJDRA==" at rune 1564; old=8+8, new=8+0.
+	doc2 := strings.Repeat("x", 1564) + "QUJDRA==RkZGRg==tail"
+	want2 := "@@ -1564,16 +1564,8 @@\n QUJDRA%3D%3D\n-RkZGRg%3D%3D\n"
+	got2 := makeDiff(1564, "QUJDRA==", "RkZGRg==", "")
+	if got2 != want2 {
+		t.Fatalf("delete frame:\n got %q\nwant %q", got2, want2)
 	}
-	if ctxBefore > diffContextLines {
-		t.Fatalf("leading context %d exceeds %d", ctxBefore, diffContextLines)
+	if res, applied, err := fakeApplyDiff(doc2, got2); err != nil || !applied || res != strings.Repeat("x", 1564)+"QUJDRA==tail" {
+		t.Fatalf("delete frame must apply: applied=%v err=%v", applied, err)
 	}
-	if res, err := fakeApplyDiff(strings.TrimSuffix(long, "\n"), d); err != nil || res != strings.TrimSuffix(changed, "\n") {
-		t.Fatalf("long-doc hunk must apply: %v", err)
+
+	// Frame 3 (REPLACE): block-content swap — same context, "-" the old data,
+	// "+" the new data; old=8+8, new=8+8.
+	want3 := "@@ -1564,16 +1564,16 @@\n QUJDRA%3D%3D\n-RkZGRg%3D%3D\n+QUJDRQ%3D%3D\n"
+	got3 := makeDiff(1564, "QUJDRA==", "RkZGRg==", "QUJDRQ==")
+	if got3 != want3 {
+		t.Fatalf("replace frame:\n got %q\nwant %q", got3, want3)
+	}
+	if res, applied, err := fakeApplyDiff(doc2, got3); err != nil || !applied || res != strings.Repeat("x", 1564)+"QUJDRA==QUJDRQ==tail" {
+		t.Fatalf("replace frame must apply: applied=%v err=%v", applied, err)
+	}
+
+	// A stale patch (context moved) must be a SILENT no-op, not an error.
+	if _, applied, err := fakeApplyDiff(doc2+"more", makeDiff(1564, "ZZZZZZZZ", "RkZGRg==", "")); err != nil || applied {
+		t.Fatalf("stale patch: applied=%v err=%v, want no-op without error", applied, err)
+	}
+	// Header accounting that contradicts the chunks is Django-400 territory.
+	if _, _, err := fakeApplyDiff(doc2, "@@ -1564,99 +1564,8 @@\n QUJDRA%3D%3D\n-RkZGRg%3D%3D\n"); err == nil {
+		t.Fatal("bogus old length must be a malformed patch")
+	}
+}
+
+// The builder's own context policy: 12-rune keep chunks, and offsets/lengths
+// counted in RUNES (Cyrillic template would shift byte offsets).
+func TestBuildBlockEditRuneOffsets(t *testing.T) {
+	tmpl := "// Привет, мир — шаблон с юникодом\nconsole.log('тест');\n// конец\n"
+	doc := applyEdit(t, tmpl, "X", 0, b64Frame([]byte("payload-one")))
+	if blocks := findBlocks(doc, "X"); len(blocks) != 1 {
+		t.Fatalf("blocks=%d", len(blocks))
+	}
+	b := findBlocks(doc, "X")[0]
+
+	// Replace edit: ctx must be exactly 12 runes ending at the region start —
+	// the tail of our BEGIN line.
+	newDoc, diff, changed := buildBlockEdit(doc, "X", 0, b64Frame([]byte("payload-two")))
+	if !changed {
+		t.Fatal("changed")
+	}
+	lines := strings.Split(strings.TrimSuffix(diff, "\n"), "\n")
+	ctxChunk, err := pctDecode(strings.TrimPrefix(lines[1], " "))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := utf8.RuneCountInString(ctxChunk); r != 12 {
+		t.Fatalf("ctx runes = %d, want 12 (%q)", r, ctxChunk)
+	}
+	if !strings.HasSuffix(ctxChunk, "\n") {
+		t.Fatalf("ctx must end at the BEGIN line's newline, got %q", ctxChunk)
+	}
+	// Header offset must equal the rune (not byte) index of the ctx start.
+	m := reFakeHunk.FindStringSubmatch(lines[0])
+	if m == nil {
+		t.Fatalf("bad header %q", lines[0])
+	}
+	off, _ := strconv.Atoi(m[1])
+	olen, _ := strconv.Atoi(m[2])
+	if off != b.dataStartRune-utf8.RuneCountInString(ctxChunk) {
+		t.Fatalf("header offset %d != ctx start rune %d", off, b.dataStartRune-utf8.RuneCountInString(ctxChunk))
+	}
+	if olen != utf8.RuneCountInString(ctxChunk)+utf8.RuneCountInString(doc[b.dataStartByte:b.dataEndByte]) {
+		t.Fatalf("header old length %d wrong", olen)
+	}
+	if got, applied, aerr := fakeApplyDiff(doc, diff); aerr != nil || !applied || got != newDoc {
+		t.Fatalf("rune-offset patch must apply over Cyrillic text: applied=%v err=%v", applied, aerr)
 	}
 }

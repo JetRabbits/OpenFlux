@@ -5,16 +5,18 @@
 // the carrier: each side (exit = "X", client = "Y") owns a fenced block of
 // lines at the END of the document ("//OCX-<roomidx>-BEGIN" ... "-END") whose
 // body is the length-prefixed packet batch, base64'd and chunked into short
-// lines. A send computes the document with our block replaced, diffs it
-// against our baseline (fetched via shared_editor_room_info after subscribe and
-// kept current from every code_update push / RPC reply), and ships the minimal
-// unified diff through the "shared_editor_change_code" RPC; the server applies
-// the diff, bumps the version and broadcasts a code_update push containing the
-// FULL document to all subscribers. Receivers strip their own block, decode the
-// peer's block, and dedupe repeat pushes by version + payload hash (our own
-// edits echo back to us). A 400 from change_code means our baseline went stale
-// under a concurrent peer edit — the sender refetches room_info and retries
-// against the fresh document (bounded).
+// lines. A send computes the document with our block replaced, expresses the
+// edit as the server's own patch dialect (see makeDiff — CHARACTER (rune)
+// offsets, not line numbers: " " keep-chunk verifies context at the rune
+// offset, "-" deletes, "+" inserts, each one percent-encoded chunk with \n
+// inside as %0A), and ships it through the "shared_editor_change_code" RPC.
+// The change_code reply carries the FULL new document: on success we adopt it
+// as baseline; if it differs from what we expected (the server SILENTLY
+// no-ops — version bump, document untouched — when the patch does not match
+// at its offsets) we refetch shared_editor_room_info and retry against the
+// fresh document (bounded). Receivers strip their own block, decode the
+// peer's block, and dedupe repeat code_update pushes by version + payload
+// hash (our own edits echo back to us).
 //
 // Why not cursors: until 2026-10 data rode in the "column" field of
 // shared_editor_change_cursors as base64. In October 2026 the server started
@@ -42,6 +44,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 
@@ -254,6 +257,22 @@ func createRooms(baseURL string, n int, pause time.Duration) ([]*cupsAuth, error
 		for attempt := 0; attempt < 6; attempt++ {
 			a, lastErr = authorizeWithJar(baseURL, nil)
 			if lastErr == nil {
+				// The auto-create session (base URL, no ?room=) turns out to
+				// be a "creator" context that is NOT delivered editor pushes
+				// (verified live 2026-10: a creator connection subscribes and
+				// RPCs fine but never sees code_update; a ?room=<uuid> joiner
+				// session does). Re-authorize through our own join link and
+				// run the tunnel channels from that joiner identity; the
+				// creator session is left to drop (the room persists with
+				// joiners present — users_update confirms).
+				if a != nil && a.roomUUID != "" {
+					joiner, jerr := authorizeWithJar(baseURL+"?room="+a.roomUUID, nil)
+					if jerr == nil && joiner != nil && joiner.roomUUID == a.roomUUID {
+						a = joiner
+					} else if jerr != nil {
+						utils.Debugf("[CUPS] joiner re-auth (%s): %v", a.roomUUID, jerr)
+					}
+				}
 				break
 			}
 			msg := lastErr.Error()
@@ -644,12 +663,16 @@ func (w *cupsWS) sendLoop() {
 
 // sendBatch smuggles the batch into the room's shared code document: our block
 // (at the document tail) is replaced with the base64 of the length-prefixed
-// batch framing, and the resulting unified diff is sent via the
-// shared_editor_change_code RPC. The server applies the diff only if its
-// context lines match the stored text, so a 400 means our baseline went stale
-// under a concurrent peer edit: refetch room_info and recompute (bounded).
-// Packets are never fragmented across calls — one batch either lands whole or
-// is retried/dropped, so the peer never sees a torn framing stream.
+// batch framing, and the resulting character-offset patch (makeDiff) is sent
+// via the shared_editor_change_code RPC. The server applies the patch only if
+// its chunks match verbatim at the rune offsets — a stale baseline does NOT
+// error: it silently no-ops and bumps the version — so the accepted reply's
+// authoritative "code" (the full new document, observed live) is compared
+// against our expectation; on mismatch, or a hard rpc error, we refetch
+// room_info and recompute against the fresh document (bounded retries, then
+// drop + error like before). Packets are never fragmented across calls — one
+// batch either lands whole or is retried/dropped, so the peer never sees a
+// torn framing stream.
 func (w *cupsWS) sendBatch(batch [][]byte) error {
 	payload, totalRaw := framePackets(batch)
 	col := base64.RawStdEncoding.EncodeToString(payload)
@@ -665,8 +688,17 @@ func (w *cupsWS) sendBatch(batch [][]byte) error {
 		w.codeMu.Lock()
 		base := w.serverCode
 		w.codeMu.Unlock()
-		newCode := upsertBlock(base, w.side, w.roomIdx, col)
-		diff := makeDiff(base, newCode)
+		newCode, diff, changed := buildBlockEdit(base, w.side, w.roomIdx, col)
+		if !changed {
+			// The authoritative baseline already carries exactly this payload
+			// in our block — normally because a concurrent-write retry found
+			// our own patch had ALREADY landed (a fuzzy apply). The batch's
+			// bytes are on the server and its push went out, so account for
+			// the send; a fresh RPC would only bump the version.
+			utils.Debugf("[CUPS] change_code (%s): payload already in block, RPC skipped", w.auth.roomUUID)
+			w.countSent(len(batch), totalRaw, base)
+			return nil
+		}
 
 		data := map[string]interface{}{
 			"diff": diff,
@@ -675,25 +707,79 @@ func (w *cupsWS) sendBatch(batch [][]byte) error {
 		}
 		resp, err := w.callRPC("shared_editor_change_code", data, changeRPCTimeout)
 		if err == nil {
-			w.applyChangeSuccess(base, newCode, resp)
-			w.stats.packetsSent.Add(uint64(len(batch)))
-			w.stats.bytesSent.Add(uint64(totalRaw))
-			w.stats.batchesSent.Add(1)
-			if len(newCode) > warnCodeDocBytes {
-				// We own only our block, and every send rewrites it in full,
-				// so an oversized document self-heals on the next batch; the
-				// log just names the culprit size.
-				utils.Debugf("[CUPS] room %s code document is %d bytes after our write", w.auth.roomUUID, len(newCode))
+			utils.Debugf("[CUPS] change_code ok (%s): diff=%dB code=%dB batch=%dpkts", w.auth.roomUUID[:8], len(diff), len(newCode), len(batch))
+			code, ver, haveCode, haveVer := parseCodeResp(resp)
+			if haveCode {
+				// The reply's code is the authoritative document.
+				w.adoptServerCode(code, ver, haveVer)
+				if code == newCode {
+					w.countSent(len(batch), totalRaw, newCode)
+					return nil
+				}
+				// Silent no-op / fuzzy apply: our patch did not land.
+				lastErr = fmt.Errorf("server document (%d bytes) != expected result (%d bytes)", len(code), len(newCode))
+				utils.Debugf("[CUPS] change_code (%s) attempt %d/%d not applied: %v", w.auth.roomUUID, attempt, maxChangeCodeAttempts, lastErr)
+			} else {
+				// No code in the reply: optimistic (guarded) promotion.
+				w.applyChangeSuccess(base, newCode, resp)
+				w.countSent(len(batch), totalRaw, newCode)
+				return nil
 			}
-			return nil
+		} else {
+			lastErr = err
+			utils.Debugf("[CUPS] change_code (%s) attempt %d/%d rejected: %v", w.auth.roomUUID, attempt, maxChangeCodeAttempts, err)
 		}
-		lastErr = err
-		utils.Debugf("[CUPS] change_code (%s) attempt %d/%d rejected: %v", w.auth.roomUUID, attempt, maxChangeCodeAttempts, err)
 		if rerr := w.refreshBaseline(); rerr != nil {
 			utils.Debugf("[CUPS] baseline refresh (%s): %v", w.auth.roomUUID, rerr)
 		}
 	}
-	return fmt.Errorf("change_code rejected after %d attempts: %w", maxChangeCodeAttempts, lastErr)
+	return fmt.Errorf("change_code failed after %d attempts: %w", maxChangeCodeAttempts, lastErr)
+}
+
+func (w *cupsWS) countSent(packets, rawBytes int, newCode string) {
+	w.stats.packetsSent.Add(uint64(packets))
+	w.stats.bytesSent.Add(uint64(rawBytes))
+	w.stats.batchesSent.Add(1)
+	if len(newCode) > warnCodeDocBytes {
+		// We own only our block, and every send rewrites it in full, so an
+		// oversized document self-heals on the next batch; the log just names
+		// the culprit size.
+		utils.Debugf("[CUPS] room %s code document is %d bytes after our write", w.auth.roomUUID, len(newCode))
+	}
+}
+
+// parseCodeResp extracts code/version from a change_code rpc payload.
+func parseCodeResp(resp json.RawMessage) (code string, ver int64, haveCode, haveVer bool) {
+	if len(resp) == 0 {
+		return
+	}
+	var d struct {
+		Code    *string  `json:"code"`
+		Version *float64 `json:"version"`
+	}
+	if err := json.Unmarshal(resp, &d); err != nil {
+		return
+	}
+	if d.Code != nil {
+		code, haveCode = *d.Code, true
+	}
+	if d.Version != nil {
+		ver, haveVer = int64(*d.Version), true
+	}
+	return
+}
+
+// adoptServerCode stores an authoritative document copy (change_code reply).
+// It never rolls back below a version already reached via a fresher push.
+func (w *cupsWS) adoptServerCode(code string, ver int64, haveVer bool) {
+	w.codeMu.Lock()
+	if !haveVer || ver >= w.codeVersion {
+		w.serverCode = code
+		if haveVer && ver > w.codeVersion {
+			w.codeVersion = ver
+		}
+	}
+	w.codeMu.Unlock()
 }
 
 // applyChangeSuccess promotes the write into the baseline. If the read loop
@@ -964,12 +1050,11 @@ func hashBytes(b []byte) uint64 {
 // ---- code channel: blocks, diff, framing ----
 
 const (
-	// diffContextLines is the number of context lines a unified-diff hunk
-	// carries around the change (git default). Our edits are always one
-	// contiguous tail replacement, so exactly one hunk is produced.
-	diffContextLines = 3
+	// diffContextChars is the size of the keep-chunk (context) the server
+	// dialect verifies at the patch offset, in runes.
+	diffContextChars = 12
 	// b64LineChunk keeps base64 payload lines short so the diff stays
-	// line-granular and hunk bodies remain small.
+	// line-granular and chunk bodies remain small.
 	b64LineChunk = 200
 	// maxChangeCodeAttempts bounds the stale-baseline retry loop.
 	maxChangeCodeAttempts = 3
@@ -1051,30 +1136,179 @@ func extractBlockSide(lines []string, side string) string {
 	return ""
 }
 
-// buildBlockLines fences the base64 payload into short lines.
-func buildBlockLines(side string, idx int, payloadB64 string) []string {
-	lines := []string{blockMarker(side, idx, "BEGIN")}
-	for i := 0; i < len(payloadB64); i += b64LineChunk {
-		e := i + b64LineChunk
-		if e > len(payloadB64) {
-			e = len(payloadB64)
-		}
-		lines = append(lines, payloadB64[i:e])
+// chunkLines chops the base64 payload into lines of at most b64LineChunk
+// characters.
+func chunkLines(s string) []string {
+	if s == "" {
+		return nil
 	}
-	lines = append(lines, blockMarker(side, idx, "END"))
-	return lines
+	var out []string
+	for i := 0; i < len(s); i += b64LineChunk {
+		e := i + b64LineChunk
+		if e > len(s) {
+			e = len(s)
+		}
+		out = append(out, s[i:e])
+	}
+	return out
 }
 
-// upsertBlock replaces our fenced block in the document, appending one at the
-// tail when absent. Idempotent: any stale copies of our block (from before a
-// reconnect) are stripped first, so the result always has exactly one.
-func upsertBlock(code string, side string, idx int, payloadB64 string) string {
-	lines := strings.Split(code, "\n")
-	rest := removeBlockSide(lines, side)
-	out := make([]string, 0, len(rest)+8)
-	out = append(out, rest...)
-	out = append(out, buildBlockLines(side, idx, payloadB64)...)
-	return strings.Join(out, "\n")
+// blockText is the fenced block as it lives inside the document, WITHOUT a
+// trailing newline: "//OCX-<i>-BEGIN\n<chunk>\n...<chunk>\n//OCX-<i>-END".
+// The DATA REGION is the runes strictly between the BEGIN line's "\n" and the
+// END marker text — each chunk line (including the last) is "\n"-terminated
+// inside the region, so the "\n" that closes the region is its final rune and
+// the END line stays intact outside it.
+func blockText(side string, idx int, chunks []string) string {
+	var sb strings.Builder
+	sb.WriteString(blockMarker(side, idx, "BEGIN"))
+	sb.WriteString("\n")
+	for _, c := range chunks {
+		sb.WriteString(c)
+		sb.WriteString("\n")
+	}
+	sb.WriteString(blockMarker(side, idx, "END"))
+	return sb.String()
+}
+
+// cupsBlock locates one fenced block inside the document; byte indexes are
+// offsets into the raw string, rune indexes are the Unicode code-point counts
+// the SERVER patch dialect uses (Cyrillic template!).
+type cupsBlock struct {
+	side string
+	idx  int
+
+	beginByte      int // at '/' of "//OC..." on the BEGIN line
+	dataStartByte  int // just after the BEGIN line's "\n"
+	dataEndByte    int // at '/' of the END marker text
+	endTextEndByte int // just after the END marker text (before its "\n")
+
+	beginRune      int
+	dataStartRune  int
+	endTextEndRune int
+}
+
+// reBlockMarkerML is reBlockMarker in multi-line mode: our fences always sit
+// alone on their line.
+var reBlockMarkerML = regexp.MustCompile(`(?m)^//OC([XY])-(\d+)-(BEGIN|END)$`)
+
+// findBlocks locates every fenced block of one side, in order. A BEGIN whose
+// marker is not followed by "\n", or that has no matching END, is ignored.
+func findBlocks(doc string, side string) []cupsBlock {
+	var out []cupsBlock
+	for _, bm := range reBlockMarkerML.FindAllStringSubmatchIndex(doc, -1) {
+		if doc[bm[2]:bm[3]] != side || doc[bm[6]:bm[7]] != "BEGIN" {
+			continue
+		}
+		if bm[1] >= len(doc) || doc[bm[1]] != '\n' {
+			continue
+		}
+		idx, _ := strconv.Atoi(doc[bm[4]:bm[5]])
+		dataStart := bm[1] + 1
+		for _, em := range reBlockMarkerML.FindAllStringSubmatchIndex(doc, -1) {
+			if em[0] < dataStart || doc[em[2]:em[3]] != side || doc[em[6]:em[7]] != "END" {
+				continue
+			}
+			if eidx, _ := strconv.Atoi(doc[em[4]:em[5]]); eidx != idx {
+				continue
+			}
+			out = append(out, cupsBlock{
+				side:           side,
+				idx:            idx,
+				beginByte:      bm[0],
+				dataStartByte:  dataStart,
+				dataEndByte:    em[0],
+				endTextEndByte: em[1],
+				beginRune:      utf8.RuneCountInString(doc[:bm[0]]),
+				dataStartRune:  utf8.RuneCountInString(doc[:dataStart]),
+				endTextEndRune: utf8.RuneCountInString(doc[:em[1]]),
+			})
+			break
+		}
+	}
+	return out
+}
+
+// runeTailStart returns the BYTE index where the last n runes of s begin.
+func runeTailStart(s string, n int) int {
+	i := len(s)
+	for r := 0; r < n && i > 0; r++ {
+		_, size := utf8.DecodeLastRuneInString(s[:i])
+		i -= size
+	}
+	return i
+}
+
+// buildBlockEdit computes (newDoc, diff, changed) for writing payloadB64 into
+// our fenced block, using the server's character-offset patch dialect. Only a
+// single contiguous region can be rewritten per hunk, which is exactly our
+// edit shape:
+//
+//   - no block yet          → pure append: ctx = last diffContextChars runes
+//     of the doc, no "-" line, ins = "\n"+block+"\n".
+//   - exactly one block     → replace the DATA REGION in place; ctx = the 12
+//     runes ending at the region start (the tail of our own BEGIN line,
+//     unique per side).
+//   - several contiguous    → collapse: one hunk deletes the whole run of our
+//     blocks and inserts a single fresh one.
+//   - several, not adjacent → rewrite the last one only (stale copies are
+//     pathological — a fuzzy server apply — and the authoritative response
+//     check converges them across retries).
+//
+// changed=false means the region already holds exactly this payload: sending
+// would be a no-op patch, so the caller can skip the RPC entirely.
+func buildBlockEdit(doc string, side string, idx int, payloadB64 string) (string, string, bool) {
+	chunks := chunkLines(payloadB64)
+	data := ""
+	for _, c := range chunks {
+		data += c + "\n"
+	}
+	text := blockText(side, idx, chunks)
+	blocks := findBlocks(doc, side)
+
+	if len(blocks) == 0 {
+		a := utf8.RuneCountInString(doc)
+		ctx := doc[runeTailStart(doc, diffContextChars):]
+		ins := text + "\n"
+		if doc != "" && !strings.HasSuffix(doc, "\n") {
+			ins = "\n" + ins
+		}
+		return doc + ins, makeDiff(a-utf8.RuneCountInString(ctx), ctx, "", ins), true
+	}
+
+	if len(blocks) == 1 {
+		b := blocks[0]
+		del := doc[b.dataStartByte:b.dataEndByte]
+		if del == data {
+			return doc, "", false
+		}
+		ctxBytes := runeTailStart(doc[:b.dataStartByte], diffContextChars)
+		ctx := doc[ctxBytes:b.dataStartByte]
+		newDoc := doc[:b.dataStartByte] + data + doc[b.dataEndByte:]
+		return newDoc, makeDiff(b.dataStartRune-utf8.RuneCountInString(ctx), ctx, del, data), true
+	}
+
+	// Contiguous run of our blocks? (the only "\n" between block k and k+1 is
+	// block k's END-line terminator)
+	k := 0
+	for k+1 < len(blocks) && blocks[k].endTextEndByte+1 == blocks[k+1].beginByte {
+		k++
+	}
+	if k+1 < len(blocks) {
+		utils.Debugf("[CUPS] %d blocks for side %s, only %d adjacent — rewriting the last one", len(blocks), side, k+1)
+		b := blocks[len(blocks)-1]
+		ctxBytes := runeTailStart(doc[:b.dataStartByte], diffContextChars)
+		ctx := doc[ctxBytes:b.dataStartByte]
+		newDoc := doc[:b.dataStartByte] + data + doc[b.dataEndByte:]
+		return newDoc, makeDiff(b.dataStartRune-utf8.RuneCountInString(ctx), ctx, doc[b.dataStartByte:b.dataEndByte], data), true
+	}
+
+	first, last := blocks[0], blocks[k]
+	del := doc[first.beginByte:last.endTextEndByte]
+	ctxBytes := runeTailStart(doc[:first.beginByte], diffContextChars)
+	ctx := doc[ctxBytes:first.beginByte]
+	newDoc := doc[:first.beginByte] + text + doc[last.endTextEndByte:]
+	return newDoc, makeDiff(first.beginRune-utf8.RuneCountInString(ctx), ctx, del, text), true
 }
 
 // decodeBlockPayload decodes the concatenated base64 body written by our own
@@ -1151,52 +1385,36 @@ func jsEncode(s string) string {
 	return b.String()
 }
 
-// makeDiff emits one unified-diff hunk turning oldText into newText. We only
-// ever replace our own contiguous tail block, so a common-prefix/suffix scan
-// yields the single changed region exactly — hunk headers are exact by
-// construction: "@@ -start,lcs +start,lcs @@" with up to diffContextLines
-// context lines on each side. Line contents are percent-encoded like the real
-// client does; the "\n" between encoded lines carries the document structure.
-func makeDiff(oldText, newText string) string {
-	o := strings.Split(oldText, "\n")
-	n := strings.Split(newText, "\n")
-	p := 0
-	for p < len(o) && p < len(n) && o[p] == n[p] {
-		p++
-	}
-	s := 0
-	for s < len(o)-p && s < len(n)-p && o[len(o)-1-s] == n[len(n)-1-s] {
-		s++
-	}
-	oStart, oEnd := p, len(o)-s // changed region in old [oStart, oEnd)
-	nStart, nEnd := p, len(n)-s // changed region in new [nStart, nEnd)
-
-	hStart := oStart - diffContextLines
-	if hStart < 0 {
-		hStart = 0
-	}
-	hEnd := oEnd + diffContextLines
-	if hEnd > len(o) {
-		hEnd = len(o)
-	}
-	// The new-side hunk starts at the same line (everything before oStart is
-	// byte-identical on both sides) and spans the changed lines plus the same
-	// number of trailing context lines that follow oEnd in the old text.
-	nHunkEnd := nEnd + (hEnd - oEnd)
+// makeDiff emits the patch in the format cups.online's shared_editor_change_
+// code actually accepts (verified against live frames, 2026-10): the "@@"
+// numbers are ABSOLUTE CHARACTER (Unicode code point, 0-based) offsets into
+// the stored document and character LENGTHS — not line numbers, not bytes.
+// Body lines are whole percent-encoded chunks that may carry %0A inside:
+//
+//	" " chunk — keep/context: the runes at the offset must equal this chunk
+//	"-" chunk — deleted text, sitting right after the context in the old doc
+//	"-" line is omitted when nothing is deleted
+//	"+" chunk — inserted text, spliced in right after the context
+//
+// Header accounting (both live probes confirm): old length = |ctx|+|del|,
+// new length = |ctx|+|ins|, context counted on BOTH sides, offset = start of
+// the context chunk. The server silently NO-OPS (but bumps the version) when
+// the context/delete chunks do not sit verbatim at those offsets, so the
+// caller must verify the code returned by the RPC against the expected
+// result. jsEncode is applied per whole chunk, so interior newlines become
+// %0A inside a single body line.
+func makeDiff(offset int, ctx, del, ins string) string {
+	oLen := utf8.RuneCountInString(ctx) + utf8.RuneCountInString(del)
+	nLen := utf8.RuneCountInString(ctx) + utf8.RuneCountInString(ins)
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "@@ -%d,%d +%d,%d @@\n", hStart+1, hEnd-hStart, hStart+1, nHunkEnd-hStart)
-	for i := hStart; i < oStart; i++ {
-		b.WriteString(" " + jsEncode(o[i]) + "\n")
+	fmt.Fprintf(&b, "@@ -%d,%d +%d,%d @@\n", offset, oLen, offset, nLen)
+	b.WriteString(" " + jsEncode(ctx) + "\n")
+	if del != "" {
+		b.WriteString("-" + jsEncode(del) + "\n")
 	}
-	for i := oStart; i < oEnd; i++ {
-		b.WriteString("-" + jsEncode(o[i]) + "\n")
-	}
-	for i := nStart; i < nEnd; i++ {
-		b.WriteString("+" + jsEncode(n[i]) + "\n")
-	}
-	for i := oEnd; i < hEnd; i++ {
-		b.WriteString(" " + jsEncode(o[i]) + "\n")
+	if ins != "" {
+		b.WriteString("+" + jsEncode(ins) + "\n")
 	}
 	return b.String()
 }

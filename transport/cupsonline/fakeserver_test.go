@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 )
@@ -58,6 +59,7 @@ type fakeRoom struct {
 	subs     map[*fakePeer]bool
 	rejected int
 	applied  int
+	noop     int // change_code calls whose patch did not match (silent no-op)
 }
 
 type fakeServer struct {
@@ -112,15 +114,15 @@ func (f *fakeServer) roomObj(uuid string) *fakeRoom {
 	return f.rooms[uuid]
 }
 
-// stats returns applied/rejected change_code counters for a room.
-func (f *fakeServer) stats(uuid string) (applied, rejected int) {
+// stats returns applied/rejected/noop change_code counters for a room.
+func (f *fakeServer) stats(uuid string) (applied, rejected, noop int) {
 	r := f.roomObj(uuid)
 	if r == nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.applied, r.rejected
+	return r.applied, r.rejected, r.noop
 }
 
 // silentMutate changes the stored document server-side WITHOUT broadcasting a
@@ -316,28 +318,38 @@ func (p *fakePeer) serveRPC(id int64, method string, data json.RawMessage) {
 		}
 		ch := "$shared_editor:room-" + d.Room
 		room.mu.Lock()
-		newCode, err := fakeApplyDiff(room.code, d.Diff)
+		newCode, applied, err := fakeApplyDiff(room.code, d.Diff)
 		if err != nil {
+			// Malformed patch: Django-level input rejection. Staleness is NOT
+			// an error here — a stale patch is a SILENT no-op (see below),
+			// exactly as verified against the live service.
 			room.rejected++
 			room.mu.Unlock()
-			// The exact shape the live Django API returns for a stale diff.
 			p.send(map[string]interface{}{"id": id, "error": map[string]interface{}{
 				"code":    400,
 				"message": "Неверные данные для изменения кода: " + err.Error(),
 			}})
 			return
 		}
-		room.code = newCode
+		if applied {
+			room.code = newCode
+			room.applied++
+		} else {
+			room.noop++ // document untouched, version still bumped
+		}
 		room.version++
-		room.applied++
 		ver := room.version
+		codeNow := room.code
 		subs := make([]*fakePeer, 0, len(room.subs))
 		for sp := range room.subs {
 			subs = append(subs, sp)
 		}
 		room.mu.Unlock()
-		// Reply carries the new version (not the full doc, like the capture).
-		p.send(map[string]interface{}{"id": id, "rpc": map[string]interface{}{"data": map[string]interface{}{"version": ver}}})
+		// Reply carries the FULL stored document (observed live shape:
+		// {"id":N,"rpc":{"data":{"uuid","code",...}}}).
+		p.send(map[string]interface{}{"id": id, "rpc": map[string]interface{}{"data": map[string]interface{}{
+			"uuid": d.Room, "code": codeNow, "version": ver,
+		}}})
 		for _, sp := range subs {
 			sp.send(map[string]interface{}{"push": map[string]interface{}{
 				"channel": ch,
@@ -345,7 +357,7 @@ func (p *fakePeer) serveRPC(id int64, method string, data json.RawMessage) {
 					"data": map[string]interface{}{
 						"type": "code_update",
 						"payload": map[string]interface{}{
-							"uuid": d.Room, "code": newCode, "version": ver,
+							"uuid": d.Room, "code": codeNow, "version": ver,
 						},
 					},
 					"offset": ver,
@@ -361,74 +373,92 @@ func (p *fakePeer) serveRPC(id int64, method string, data json.RawMessage) {
 	}
 }
 
-// ---- reference diff application (mirrors what Django does server-side) ----
+// ---- reference patch application (mirrors what the live server does) ----
+//
+// The dialect proven against the live service (2026-10): the @@ numbers are
+// ABSOLUTE CHARACTER (code-point, 0-based) offsets and lengths — NOT line
+// numbers. Body lines are whole percent-encoded chunks (interior newlines as
+// %0A inside ONE line):
+//
+//	" " chunk = context that must sit verbatim at the offset
+//	"-" chunk = deleted text, following the context in the stored doc
+//	"+" chunk = inserted text, spliced right after the context
+//	header old length = |ctx|+|del| runes, new length = |ctx|+|ins| runes,
+//	offset = start of the context chunk.
+//
+// A chunk mismatch makes the server SILENTLY no-op the patch (version still
+// bumps) — applied=false here. Malformed patches (bad header/counts, unknown
+// prefixes, multiple hunks) are the Django-level 400 path (applied=false + err).
 
 var reFakeHunk = regexp.MustCompile(`^@@ -(\d+),(\d+) \+(\d+),(\d+) @@$`)
 
-func fakeApplyDiff(code, diff string) (string, error) {
+func fakeApplyDiff(code, diff string) (newCode string, applied bool, err error) {
 	if !strings.HasSuffix(diff, "\n") {
-		return "", fmt.Errorf("diff does not end with newline")
+		return "", false, fmt.Errorf("diff does not end with newline")
 	}
 	lines := strings.Split(diff, "\n")
 	lines = lines[:len(lines)-1] // trailing newline artifact
 	if len(lines) == 0 {
-		return "", fmt.Errorf("empty diff")
+		return "", false, fmt.Errorf("empty diff")
 	}
 	m := reFakeHunk.FindStringSubmatch(lines[0])
 	if m == nil {
-		return "", fmt.Errorf("missing/bad hunk header %q", lines[0])
+		return "", false, fmt.Errorf("missing/bad hunk header %q", lines[0])
 	}
 	for _, ln := range lines[1:] {
 		if strings.HasPrefix(ln, "@@ ") {
-			return "", fmt.Errorf("multiple hunks not supported")
+			return "", false, fmt.Errorf("multiple hunks not supported")
 		}
 	}
 	a, _ := strconv.Atoi(m[1])
 	b, _ := strconv.Atoi(m[2])
 	d, _ := strconv.Atoi(m[4])
 
-	var oldSeq, newSeq []string
+	var ctxB, delB, insB []byte
 	for _, ln := range lines[1:] {
 		if ln == "" {
-			return "", fmt.Errorf("empty line inside hunk body")
+			return "", false, fmt.Errorf("empty line inside hunk body")
 		}
-		content, err := pctDecode(ln[1:])
-		if err != nil {
-			return "", err
+		content, derr := pctDecode(ln[1:])
+		if derr != nil {
+			return "", false, derr
 		}
 		switch ln[0] {
 		case ' ':
-			oldSeq = append(oldSeq, content)
-			newSeq = append(newSeq, content)
+			ctxB = append(ctxB, content...)
 		case '-':
-			oldSeq = append(oldSeq, content)
+			delB = append(delB, content...)
 		case '+':
-			newSeq = append(newSeq, content)
+			insB = append(insB, content...)
 		default:
-			return "", fmt.Errorf("unknown hunk line prefix %q", ln[0])
+			return "", false, fmt.Errorf("unknown hunk line prefix %q", ln[0])
 		}
 	}
-	if len(oldSeq) != b {
-		return "", fmt.Errorf("hunk header says %d old lines, body has %d", b, len(oldSeq))
+	ctx, del, ins := string(ctxB), string(delB), string(insB)
+	if utf8.RuneCountInString(ctx)+utf8.RuneCountInString(del) != b {
+		return "", false, fmt.Errorf("header old length %d != ctx(%d)+del(%d) runes", b, utf8.RuneCountInString(ctx), utf8.RuneCountInString(del))
 	}
-	if len(newSeq) != d {
-		return "", fmt.Errorf("hunk header says %d new lines, body has %d", d, len(newSeq))
+	if utf8.RuneCountInString(ctx)+utf8.RuneCountInString(ins) != d {
+		return "", false, fmt.Errorf("header new length %d != ctx(%d)+ins(%d) runes", d, utf8.RuneCountInString(ctx), utf8.RuneCountInString(ins))
 	}
-	doc := strings.Split(code, "\n")
-	start := a - 1
-	if start < 0 || start+b > len(doc) {
-		return "", fmt.Errorf("hunk @@ -%d,%d @@ out of document (%d lines)", a, b, len(doc))
+
+	R := []rune(code)
+	off := a
+	if off < 0 || off+b > len(R) {
+		return code, false, nil // cannot match ⇒ silent no-op
 	}
-	for i := 0; i < b; i++ {
-		if doc[start+i] != oldSeq[i] {
-			return "", fmt.Errorf("context mismatch at line %d: document has %q, diff expects %q", start+i+1, doc[start+i], oldSeq[i])
-		}
+	if string(R[off:off+utf8.RuneCountInString(ctx)]) != ctx {
+		return code, false, nil
 	}
-	parts := make([]string, 0, len(doc))
-	parts = append(parts, doc[:start]...)
-	parts = append(parts, newSeq...)
-	parts = append(parts, doc[start+b:]...)
-	return strings.Join(parts, "\n"), nil
+	delStart := off + utf8.RuneCountInString(ctx)
+	if string(R[delStart:off+b]) != del {
+		return code, false, nil
+	}
+	out := make([]rune, 0, len(R)+utf8.RuneCountInString(ins))
+	out = append(out, R[:delStart]...)
+	out = append(out, []rune(ins)...)
+	out = append(out, R[off+b:]...)
+	return string(out), true, nil
 }
 
 func pctDecode(s string) (string, error) {
