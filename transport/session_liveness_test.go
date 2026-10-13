@@ -106,3 +106,25 @@ func TestSessionToleratesPeerWithoutKeepalive(t *testing.T) {
 	}
 	eventually(t, "data delivery", func() bool { return got.Load() == 1 })
 }
+
+// Carriers of equal top priority share the traffic, so the app must be told
+// all of them, and not the lower-priority standby.
+func TestSessionActiveTransportsNameTheWholeTopGroup(t *testing.T) {
+	priorities := []int{100, 100, 50}
+	client, exit, _, _ := linkedSessionsWith(t, func(i int) int { return priorities[i] }, "boards", "yandex", "direct")
+	fastKeepalive(client, exit)
+	startPair(t, client, exit)
+
+	eventually(t, "both top-priority carriers to be active", func() bool {
+		got := client.ActiveTransports()
+		return len(got) == 2 && got[0] == "boards" && got[1] == "yandex"
+	})
+	if got := client.ActiveTransport(); got != "boards" {
+		t.Fatalf("ActiveTransport = %q, want the first of the group", got)
+	}
+
+	_ = client.Stop()
+	if got := client.ActiveTransports(); got != nil {
+		t.Fatalf("ActiveTransports after Stop = %v, want none", got)
+	}
+}

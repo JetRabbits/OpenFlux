@@ -38,15 +38,36 @@
 |-----------|---------|------------|
 | **macOS**   | сборка из исходников | CLI + utun L3-клиент (`--inbound=tun`, по умолчанию на macOS) |
 | **Linux**   | сборка из исходников | CLI-клиент (SOCKS5) / выходная нода (L3 или L4) |
-| **Windows** | сборка из исходников | CLI-клиент (SOCKS5) / выходная нода (`l4`, либо `l3` через QEMU - см. TODO) |
-| **Android** | [Релизы OpenFluxAndroid](https://github.com/p1neappleXpress/OpenFluxAndroid) | Отдельный APK |
+| **Windows** | сборка из исходников | CLI-клиент (SOCKS5, либо `--inbound=tun` через Wintun - нужны права администратора) / выходная нода (`l4`, либо `l3` через QEMU - см. TODO) |
+| **Desktop** | [Релизы OpenFluxDesktop](https://github.com/p1neappleXpress/OpenFluxDesktop) | Windows/macOS/Linux: полный туннель или SOCKS5/HTTP-прокси, сессии с несколькими транспортами, шифрование, мастер разворачивания ноды по SSH из приложения |
+| **Android** | [Релизы OpenFluxAndroid](https://github.com/p1neappleXpress/OpenFluxAndroid) | Системный VPN или локальный SOCKS5, сессии с несколькими транспортами и переключением между ними, шифрование, обработка капчи во встроенном браузере |
+| **Android** | [Релизы OpenFlux-Android](https://github.com/damnurmum/OpenFlux-Android/releases/latest) | Форк: системный VPN или SOCKS5-прокси, сессии с несколькими транспортами, обработка капчи, телефон как выходная нода |
 | **iOS**     | [TestFlight бета](https://testflight.apple.com/join/BwnAcdus) | Системный VPN через Network Extension |
 
 > **iOS-приложение** сделано [@saharev1](https://github.com/saharev1) -
 > полноценный iOS-клиент, пайплайн TestFlight, системный VPN, DNS-over-TLS
 > и множество фиксов стабильности. ОГРОМНОЕ спасибо!
 >
-> **Android-приложение** - [p1neappleXpress/OpenFluxAndroid](https://github.com/p1neappleXpress/OpenFluxAndroid).
+> **OpenFlux-Android** сделан [@damnurmum](https://github.com/damnurmum) -
+> Android-клиент с системным VPN и режимом локального SOCKS5-прокси, профилями
+> подключений, сессиями с несколькими транспортами и переключением между ними
+> (включая direct), обработкой SmartCaptcha и входа во встроенном браузере (в том
+> числе капчи выходной ноды, которая проходится через туннель с её адреса),
+> режимом выходной ноды l4 на телефоне, Kill Switch и маршрутизацией по
+> приложениям и доменам. Также внёс в этот репозиторий сквозное шифрование (#38),
+> транспорт Mail.ru (#60) и устойчивость сессий с обработкой капчи ноды (#93).
+> ОГРОМНОЕ спасибо!
+>
+> **OpenFluxAndroid и OpenFluxDesktop** используют Compose Multiplatform
+> приложение и общий модуль (сессии с несколькими транспортами, шифрование,
+> встроенный браузер для капчи, мастер разворачивания ноды по SSH),
+> изначально написанные [@meepo161](https://github.com/meepo161) в
+> [OpenFluxClient](https://github.com/meepo161/OpenFluxClient) и перенесённые
+> в эти репозитории с его согласия. ОГРОМНОЕ спасибо!
+>
+> **Android-приложение** - [p1neappleXpress/OpenFluxAndroid](https://github.com/p1neappleXpress/OpenFluxAndroid),
+> **desktop-приложение** - [p1neappleXpress/OpenFluxDesktop](https://github.com/p1neappleXpress/OpenFluxDesktop),
+> общий модуль обоих - [p1neappleXpress/OpenFluxClientShared](https://github.com/p1neappleXpress/OpenFluxClientShared).
 
 ## Архитектура
 
@@ -151,7 +172,29 @@ RST, которые локально генерирует ядро выходн�
 - **macOS utun-клиент** - `--inbound=tun` (по умолчанию на macOS). Создаёт
   utun-интерфейс, следит за своими сокетами и ставит bypass-маршруты, затем
   забирает default-маршрут. Никакого SOCKS5, никакого gVisor на клиенте.
+- **Windows tun-клиент** - `--inbound=tun` на Windows использует адаптер
+  Wintun (нужны права администратора и `wintun.dll` рядом с бинарником) для
+  такого же полного туннелирования, как на macOS: собственные сокеты ядра
+  привязаны к реальному интерфейсу, чтобы транспорты не заворачивались в
+  туннель сами, IPv6 заворачивается в адаптер и отбрасывается, так что
+  программы переходят на IPv4, а маршруты живут ровно пока живёт адаптер.
 - **iOS packet tunnel** - NEPacketTunnelProvider, чистый L3-форвардинг.
+- **Мастер развёртывания ноды** - `--node-wizard` запускает протокол
+  JSON-по-stdin/stdout (один объект на строку) для десктопного приложения,
+  чтобы развернуть новую выходную ноду по SSH неинтерактивно: он использует
+  `provision/`, чтобы подключиться, заставить VDS скачать и проверить
+  установочный скрипт с закреплённым хешем, и вернуть готовую ссылку
+  `openflux://` для новой ноды. Канал может идти через любое сочетание
+  документа Яндекса, публичного документа Mail.ru и комнат cups.online
+  (мастер создаёт их сам), direct всегда остаётся резервом. По желанию
+  `openflux-node-update.timer` держит ядро сервера на последнем релизе
+  `node-v*`: раз в 6 часов проверяет GitHub, сверяет ядро с `node-install.sh`
+  и `SHA256SUMS` самого релиза, перезапускает каналы и откатывается (и
+  больше не ставит этот релиз), если канал не поднялся. Строка
+  `repo=owner/name` в `/etc/openflux-node/update.conf` переключает его на
+  релизы другого репозитория. Секреты (пароли SSH/sudo, приватный ключ,
+  ключ канала) передаются только через stdin, никогда через командную строку
+  или в лог.
 - **Legacy-кодек** - `--codec=legacy` возвращает старый per-packet LZ4-кодек
   (совместим со старыми клиентами).
 - **Опциональное шифрование** - `--encryption-key-file` оборачивает транспорт
@@ -178,13 +221,13 @@ OpenFlux/
   transport_factory.go             # Создание транспорта по типу
   ipc_handler.go                   # IPC: cookies от приложения
   auth_proxy.go                    # Локальный HTTP-прокси для проверок ноды
+  share_cli.go                     # --share: ссылка и QR-код для клиентов
+  share/                           # Ссылки openflux:// и QR-коды
   bench.go                         # Хелперы бенчмарка
   tun_darwin.go                    # macOS utun L3-клиент
   tun_watch.go                     # Watcher сокетов для bypass-маршрутов
   tun_learn.go, tun_other.go       # Хелперы utun / заглушки для не-darwin
   signals_{unix,windows}.go        # Сигналы завершения
-  export_ios.go                    # cgo-мост для iOS-статической библиотеки
-  export_ios_packet.go             # Мост packet tunnel для iOS
   transport/
     transport.go                   # Интерфейс Transport
     batched.go                     # BatchedTransport (склейка + zstd)
@@ -227,6 +270,8 @@ OpenFlux/
   network/                         # Контрольные суммы, разбор пакетов
   utils/                           # Логирование
   ios-app/                         # iOS-клиент на SwiftUI (XcodeGen)
+  mobile/                          # Мост для приложений: gomobile (Android) и
+                                   # C-библиотека iOS (mobile/ios, liboflux.a)
   build_all.sh                     # Кросс-сборка релизных бинарников
   build_ios.sh                     # Сборка статической библиотеки iOS (liboflux.a)
   build_ios_app.sh                 # Сборка + архив + экспорт IPA iOS
@@ -284,6 +329,18 @@ sudo ./openflux --role=client --inbound=tun \
 Создаёт utun-интерфейс, ставит bypass-маршруты для транспорта, ждёт
 подключения транспорта, затем забирает default-маршрут. SOCKS5 не нужен.
 Требует sudo. Весь трафик, кроме транспорта, идёт через туннель.
+
+### Клиент - Windows tun (Wintun, нужны права администратора)
+
+```
+./openflux --role=client --inbound=tun \
+    --transport=yandex \
+    --url="YOUR_YANDEX_DOC_URL"
+```
+
+Нужен `wintun.dll` рядом с бинарником (или в `PATH`) и запуск от имени
+администратора. Такое же полное туннелирование, как у macOS-клиента: без
+SOCKS5, весь трафик кроме транспорта идёт через туннель.
 
 ### Клиент - SOCKS5 (все платформы, fallback)
 
@@ -422,6 +479,29 @@ URL = YOUR_YANDEX_DOC_URL
 50), `URL`, `Dial` / `Listen` (direct) и `Token` / `UID` (MAX). `.conf` с
 секциями транспортов всегда запускается как согласованная сессия.
 
+### Раздача выходной ноды через QR-код
+
+Запустите выходную ноду с `--share`, и она напечатает ссылку `openflux://` и
+её QR-код (в терминале или в логе сервиса). Клиент сканирует его или
+открывает ссылку и получает транспорты ноды, приоритеты, режим сессии, ключ и
+контекст шифрования, а `direct` указывает на саму ноду:
+
+```
+./openflux --role=exit --mode=l3 --negotiate \
+    --transports=direct:100,yandex:50 --direct-listen=0.0.0.0:8445 \
+    --encryption-key-file=secret.txt --url="YOUR_YANDEX_DOC_URL" \
+    --share --share-host=EXIT_PUBLIC_IP
+```
+
+- В ссылке лежит ключ шифрования: обращайтесь с ней и с QR-кодом как с файлом
+  ключа.
+- `--share-host` - адрес, по которому клиенты подключаются к `direct`; по
+  умолчанию первый публичный IPv4 хоста.
+- MAX в ссылку не попадает (токен принадлежит одному аккаунту), Cups.online
+  тоже, если комнаты создаются при старте.
+- Формат и отрисовка QR находятся в пакете `share` (`Encode`, `Decode`,
+  `PNG`, `Bitmap`, `Terminal`), им могут пользоваться и приложения.
+
 ### Капча
 
 - **PoW-капчу** (`showcaptchafast`) транспорт решает сам, ничего делать не
@@ -494,15 +574,18 @@ URL = YOUR_YANDEX_DOC_URL
 | Флаг | Короткий | По умолчанию | Описание |
 |------|----------|--------------|----------|
 | `--role` | `-r` | `client` | `client` \| `exit` \| `bench-send` \| `bench-sink` |
-| `--inbound` | `-i` | (платформа) | `tun` (macOS) \| `socks5` |
+| `--inbound` | `-i` | (платформа) | `tun` (macOS/Windows через Wintun) \| `socks5` |
 | `--transport` | `-t` | `yandex` | `yandex` \| `vyandex` \| `boards` \| `oneme` \| `cupsonline` \| `mailru` |
 | `--mode` | `-m` | `l3` | Режим выходной ноды: `l3` \| `l4` |
 | `--codec` | `-c` | `batched` | `batched` \| `legacy` |
 | `--url` | `-u` | `http://#` | URL документа |
 | `--socks5` | `-s` | `:1080` | Адрес SOCKS5-прокси |
+| `--http-proxy` | | | Дополнительно поднять HTTP-прокси (CONNECT + обычные запросы) на этом адресе |
 | `--local-ip` | `-l` | (авто) | Egress IP для l3 SNAT / фильтра RST |
-| `--debug` | `-d` | `false` | Подробное per-packet логирование |
+| `--debug` | `-d`, `-dd`, `-ddd` | `0` | `1`: строка на каждый пакет (`-> 52 bytes - UDP ...`); `2`: плюс рабочие логи; `3`: плюс hexdump |
+| `--sensitive` | | `false` | Ещё и ключи, а с `-ddd` — расшифрованные фреймы (куки, токены) |
 | `--encryption-key-file` | | | Файл с общим секретом для AES-256-GCM |
+| `--session-context` | | (вычисляется) | KDF-контекст ключа; по умолчанию `--url`, иначе URL транспорта с наивысшим приоритетом, иначе `http://#` |
 | `--maxToken` | | | Токен авторизации MAX (`--transport=oneme`) |
 | `--maxUid` | | | ID пользователя MAX (`--transport=oneme`) |
 | `--bench-bytes` | | `0` | Сколько MB залить (`--role=bench-send`) |
@@ -513,10 +596,16 @@ URL = YOUR_YANDEX_DOC_URL
 | `--direct-dial` | | | Адрес выходной ноды для `direct` (клиент) |
 | `--direct-listen` | | | Адрес прослушивания для `direct` (выходная нода) |
 | `--yandex-url`, `--vyandex-url`, `--boards-url`, `--mailru-url`, `--cupsonline-url` | | | Ссылка на документ по типу транспорта в сессии |
+| `--yandex-cookies-file` | | | Netscape `cookies.txt` с логином Яндекса, для `vyandex` |
 | `--oneme-token`, `--oneme-uid` | | | Данные MAX в сессии |
 | `--config` | | | Файл `.conf`; флаги важнее него |
 | `--cookie-store` | | `./cookies-<transport>.json` | Файл с cookies |
 | `--ipc-socket` | | | Unix-сокет для приложения (запросы капчи, cookies) |
+| `--share` | | `false` | Выходная нода: напечатать ссылку `openflux://` и QR-код для клиентов |
+| `--share-host` | | (первый публичный IPv4) | Выходная нода: адрес для `direct` в этой ссылке |
+| `--node-wizard` | | | Единственный аргумент: запускает протокол развёртывания по JSON-over-stdio вместо обычного запуска CLI (см. [Ключевые особенности](#ключевые-особенности)) |
+| `--parse-link` | | | `--parse-link <ссылка\|->`: читает ссылку openflux:// (`-`: из stdin) и печатает JSON `{"config","context"}` или `{"error","code","param"}` — тот же разбор, что у всех клиентов |
+| `--make-link` | | | `--make-link <json\|->`: собирает ссылку из конфигурации (`-`: из stdin) и печатает `{"link","config","context"}` или ошибку — так ссылку выпускает любой клиент |
 
 Устаревшие (оставлены на один релиз, автоматически маппятся на новые флаги):
 `--client`, `--exit-node`, `--tun`, `--socks5-mode`, `--legacy`,

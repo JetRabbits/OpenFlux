@@ -16,6 +16,12 @@ var testParams = PeerParameters{
 // name, in the given priority order.
 func linkedSessions(t *testing.T, names ...string) (client, exit *Session, cw, ew map[string]*startCountingWire) {
 	t.Helper()
+	return linkedSessionsWith(t, func(i int) int { return 100 - i*10 }, names...)
+}
+
+// linkedSessionsWith is linkedSessions with the i-th carrier at priority(i).
+func linkedSessionsWith(t *testing.T, priority func(i int) int, names ...string) (client, exit *Session, cw, ew map[string]*startCountingWire) {
+	t.Helper()
 	var err error
 	if client, err = NewSession(testParams, false); err != nil {
 		t.Fatal(err)
@@ -33,11 +39,10 @@ func linkedSessions(t *testing.T, names ...string) (client, exit *Session, cw, e
 		a, b := &startCountingWire{}, &startCountingWire{}
 		a.peer, b.peer = &b.negotiationWire, &a.negotiationWire
 		cw[name], ew[name] = a, b
-		priority := 100 - i*10
-		if err := client.AddTransport(name, a, testSessionSecret, testSessionCtx, priority); err != nil {
+		if err := client.AddTransport(name, a, testSessionSecret, testSessionCtx, priority(i)); err != nil {
 			t.Fatal(err)
 		}
-		if err := exit.AddTransport(name, b, testSessionSecret, testSessionCtx, priority); err != nil {
+		if err := exit.AddTransport(name, b, testSessionSecret, testSessionCtx, priority(i)); err != nil {
 			t.Fatal(err)
 		}
 	}

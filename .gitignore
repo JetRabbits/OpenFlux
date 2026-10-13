@@ -5,8 +5,6 @@ github_output/
 *.dll
 *.so
 *.dylib
-universal-bypass-tool
-universal-bypass-tool-*
 app
 app.exe
 
@@ -33,6 +31,8 @@ Thumbs.db
 
 .env
 .env.local
+yandex-cookies*.txt
+cookies.txt
 
 .gradle/
 *.hprof
@@ -50,9 +50,6 @@ ios-app/DerivedData/
 app-linux
 app-darwin
 app.exe
-universal-bypass-tool
-universal-bypass-tool.exe
-universal-bypass-tool
 oflx
 oflx-new
 deploy.sh
@@ -63,3 +60,14 @@ watch_stats.sh
 *.log
 openflux
 *.bak
+core.bin
+phpbox_bundle/
+
+# Local scratch for testing against real hosts. These can hold host logins and
+# keys: they must never be committed (keep them out of the tree if you can).
+/deploy_phpbox.py
+/upload_bundle.sh
+/upload_probes.sh
+/probe_*.php
+/stress-out/
+/stresstest/

@@ -29,9 +29,11 @@ package cupsonline
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -63,6 +65,15 @@ const (
 // constructors at a fake cups.online deployment (httptest). Production code
 // never reassigns it.
 var roomBaseURL = baseRoomURL
+
+// SetBaseRoomURL aims the transport at another server and returns what puts
+// the old address back. For tests only (a fake cups.online, in this package's
+// tests and in the native-vs-JS interop tests of transport/script).
+func SetBaseRoomURL(u string) (restore func()) {
+	old := roomBaseURL
+	roomBaseURL = u
+	return func() { roomBaseURL = old }
+}
 
 type CupsonlineConfig struct {
 	WSHandshakeTimeout  time.Duration
@@ -323,6 +334,48 @@ func unpackRooms(s string) ([]string, error) {
 		return nil, fmt.Errorf("json decode: %w", err)
 	}
 	return ids, nil
+}
+
+// CreateRoomList creates new rooms, as an exit started without a room list
+// does, and returns their packed list for --url. Upstream's provisioning API
+// (the phpbox "Своя нода" wizard); it rides createRooms above, so the rooms
+// are created with the same joiner re-auth the code-channel transport needs.
+func CreateRoomList(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	cfg := DefaultCupsonlineConfig()
+	auths, err := createRooms(roomBaseURL, cfg.NumRooms, cfg.RoomCreatePause)
+	if err != nil {
+		if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "429") {
+			return "", errors.New("cups.online отказывает этому адресу в новых комнатах (похоже на ограничение по частоте), попробуйте позже или выберите другой транспорт")
+		}
+		return "", err
+	}
+	if len(auths) == 0 {
+		return "", fmt.Errorf("cups.online не создал комнаты")
+	}
+	return packRooms(auths), nil
+}
+
+// CreateRoom creates one room and returns its uuid: what a phpbox exit, which
+// joins exactly one room, needs.
+func CreateRoom(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	cfg := DefaultCupsonlineConfig()
+	auths, err := createRooms(roomBaseURL, 1, cfg.RoomCreatePause)
+	if err != nil {
+		if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "429") {
+			return "", errors.New("cups.online отказывает этому адресу в новых комнатах (похоже на ограничение по частоте), попробуйте позже или выберите другой транспорт")
+		}
+		return "", err
+	}
+	if len(auths) == 0 {
+		return "", errors.New("cups.online не создал комнату")
+	}
+	return auths[0].roomUUID, nil
 }
 
 // ---- per-channel stats ----
@@ -1466,6 +1519,41 @@ type CupsonlineTransport struct {
 
 	stopCh     chan struct{}
 	statsStart time.Time
+
+	roomsMu    sync.Mutex
+	roomList   string
+	onRoomList func(packed string)
+}
+
+// RoomList is the packed list of the rooms this transport keeps channels
+// to, the --url a client needs: the rooms an exit created, or re-joined from
+// its own --url. "" until Start has entered or created them.
+func (t *CupsonlineTransport) RoomList() string {
+	t.roomsMu.Lock()
+	defer t.roomsMu.Unlock()
+	return t.roomList
+}
+
+// OnRoomList calls f with the new list whenever RoomList changes, e.g. when
+// a start that failed is retried and creates the rooms after all.
+func (t *CupsonlineTransport) OnRoomList(f func(packed string)) {
+	t.roomsMu.Lock()
+	t.onRoomList = f
+	t.roomsMu.Unlock()
+}
+
+// setRoomList publishes the packed room list and notifies the watcher
+// (the session's share-link code) when it changed.
+func (t *CupsonlineTransport) setRoomList(auths []*cupsAuth) {
+	packed := packRooms(auths)
+	t.roomsMu.Lock()
+	changed := packed != t.roomList
+	t.roomList = packed
+	f := t.onRoomList
+	t.roomsMu.Unlock()
+	if changed && f != nil {
+		f(packed)
+	}
 }
 
 func NewCupsonlineTransport(rawURL string, cfg transport.TransportConfig, isClient bool) *CupsonlineTransport {
@@ -1538,11 +1626,13 @@ func (t *CupsonlineTransport) Start() error {
 		if len(auths) == 0 {
 			return fmt.Errorf("no rooms joined")
 		}
+		t.setRoomList(auths)
 	} else {
 		auths, err = createRooms(t.baseURL, t.config.NumRooms, t.config.RoomCreatePause)
 		if err != nil {
 			return fmt.Errorf("create rooms: %w", err)
 		}
+		t.setRoomList(auths)
 		packed := packRooms(auths)
 		fmt.Printf("\n=== COPY THIS TO CLIENT ===\n")
 		fmt.Printf("%s\n", packed)

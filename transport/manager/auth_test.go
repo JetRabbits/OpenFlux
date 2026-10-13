@@ -68,6 +68,15 @@ func connectedManagers(t *testing.T, exitProvider CookieProvider) (client, exit 
 	if err := client.Start(); err != nil {
 		t.Fatal(err)
 	}
+	// Control messages need a negotiated session; on a slow runner the
+	// handshake can outlast a caller that starts sending right away.
+	deadline := time.Now().Add(10 * time.Second)
+	for !client.IsConnected() || !exit.IsConnected() {
+		if time.Now().After(deadline) {
+			t.Fatal("managers did not connect")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	return client, exit
 }
 
@@ -78,11 +87,11 @@ func TestAuthRequiredRoundTrip(t *testing.T) {
 	client, exit := connectedManagers(t, provider)
 
 	asked := make(chan [3]string, 1)
-	client.SetRemoteAuthNotifier(func(name, url, reason string) { asked <- [3]string{name, url, reason} })
+	client.SetRemoteAuthNotifier(func(name, url, html, reason string) { asked <- [3]string{name, url, reason} })
 	var localReports int
-	exit.SetCaptchaNotifier(func(string, string, string) { localReports++ })
+	exit.SetCaptchaNotifier(func(string, string, string, string) { localReports++ })
 
-	exit.NotifyCaptcha("yandex", "https://docs.example/d", "smartcaptcha")
+	exit.NotifyCaptcha("yandex", "https://docs.example/d", "", "smartcaptcha")
 	select {
 	case got := <-asked:
 		if got != [3]string{"yandex", "https://docs.example/d", "smartcaptcha"} {
@@ -114,8 +123,8 @@ func TestAuthRequiredRoundTrip(t *testing.T) {
 func TestClientDoesNotForwardAuth(t *testing.T) {
 	client, exit := connectedManagers(t, &fakeCookieProvider{})
 	asked := make(chan struct{}, 1)
-	exit.SetRemoteAuthNotifier(func(string, string, string) { asked <- struct{}{} })
-	client.NotifyCaptcha("yandex", "https://docs.example/d", "smartcaptcha")
+	exit.SetRemoteAuthNotifier(func(string, string, string, string) { asked <- struct{}{} })
+	client.NotifyCaptcha("yandex", "https://docs.example/d", "", "smartcaptcha")
 	select {
 	case <-asked:
 		t.Fatal("client forwarded its own check to the exit")

@@ -10,10 +10,15 @@ import "encoding/json"
 type CookiesPayload struct {
 	// Transport names the transport the cookies belong to. Empty (older
 	// peers) means the highest-priority transport that carries cookies.
-	Transport string            `json:"transport,omitempty"`
-	Jar       map[string]string `json:"jar,omitempty"`
-	Domain    string            `json:"domain,omitempty"`
-	Reason    string            `json:"reason,omitempty"`
+	Transport string `json:"transport,omitempty"`
+	// Doc is the document URL of that transport on the sender's side, so
+	// the receiver can find its own carrier when the two sides name them
+	// differently (an app naming carriers after their type, a .conf naming
+	// sections freely). Optional; older peers ignore it.
+	Doc    string            `json:"doc,omitempty"`
+	Jar    map[string]string `json:"jar,omitempty"`
+	Domain string            `json:"domain,omitempty"`
+	Reason string            `json:"reason,omitempty"`
 }
 
 // Encode serializes the payload to JSON.
@@ -37,7 +42,15 @@ func DecodeCookies(b []byte) (*CookiesPayload, error) {
 type AuthRequiredPayload struct {
 	Transport string `json:"transport"`
 	URL       string `json:"url"`
-	Reason    string `json:"reason"`
+	// HTML is a script transport's own setup/login page (see
+	// transport/script/js/template_html.html), forwarded instead of URL
+	// when the exit's transport raised it with one; "" for every native
+	// transport, which only ever point at a real site. Older peers ignore
+	// an unknown field, same as Doc below.
+	HTML   string `json:"html,omitempty"`
+	Reason string `json:"reason"`
+	// Doc: see CookiesPayload.Doc.
+	Doc string `json:"doc,omitempty"`
 }
 
 // Encode serializes the payload to JSON.
