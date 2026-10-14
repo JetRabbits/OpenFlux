@@ -87,11 +87,26 @@ type CupsonlineConfig struct {
 	// Батчинг внутри одного WS. 32 KB — потолок Centrifugo (64 KB push).
 	BatchMaxPackets int
 	BatchMaxBytes   int
-	BatchTimeout    time.Duration
+
+	// BatchTimeout is the maximum dwell of a batch from its FIRST queued
+	// frame: sustained streams fill to MaxCodeBytesPerBatch long before it
+	// expires, and an idle sender flushes earlier through BatchIdleFlush.
+	// Every send rewrites our whole block, so the document itself is the
+	// cost of a change_code call — the dwell exists to make each call carry
+	// ≳10KB of payload instead of one tunnel packet (~1.3KB) against a
+	// ~30KB document.
+	BatchTimeout time.Duration
+
+	// BatchIdleFlush flushes a partially filled batch this long after the
+	// last frame when the send queue has drained (interactive traffic:
+	// browsing must not pay the full dwell). A still-arriving stream keeps
+	// batching until the dwell or the byte cap.
+	BatchIdleFlush time.Duration
 
 	// MaxCodeBytesPerBatch limits the framed payload carried in ONE
 	// shared_editor_change_code call (base64 of it lands in the room code
-	// document). Keeps the total document around template + 2 blocks < ~8KB.
+	// document). Keeps the total document around template + 2 blocks well
+	// under the Centrifugo push ceiling (~34KB total).
 	// We own only our own block, so an oversized doc always self-heals: the
 	// next send replaces our whole block with a fresh bounded payload.
 	MaxCodeBytesPerBatch int
@@ -122,11 +137,20 @@ func DefaultCupsonlineConfig() CupsonlineConfig {
 		// BatchMaxBytes остаётся жёстким потолком пакета (probe-era legacy);
 		// фактический гейт отправки — Min(BatchMaxBytes, MaxCodeBytesPerBatch),
 		// т.к. payload теперь живёт в тексте комнаты (base64 ×4/3).
+		//
+		// The dwell/cap pair below targets ≳12KB of payload per
+		// change_code call: the tunnel hands us ~1.3KB per Send (one gVisor
+		// packet; StripedTransport fragments to 1294B pieces), and EVERY
+		// call rewrites our whole block against a ~30KB document, so a
+		// per-packet flush costs ~40:1 wire amplification. 12KB batches put
+		// that back at ~2.5:1; BatchIdleFlush keeps a drained queue (plain
+		// browsing) from waiting out the dwell.
 		BatchMaxPackets: 64,
 		BatchMaxBytes:   32 * 1024,
-		BatchTimeout:    2 * time.Millisecond,
+		BatchTimeout:    70 * time.Millisecond,
+		BatchIdleFlush:  12 * time.Millisecond,
 
-		MaxCodeBytesPerBatch: 3072,
+		MaxCodeBytesPerBatch: 12288,
 
 		SendQueueSize: 65536,
 
@@ -655,7 +679,8 @@ func (w *cupsWS) keepAliveLoop(stop chan struct{}) {
 func (w *cupsWS) sendLoop() {
 	batch := make([][]byte, 0, w.config.BatchMaxPackets)
 	totalBytes := 0
-	timer := time.NewTimer(w.config.BatchTimeout)
+	var firstAt time.Time // when the batch's first frame arrived (zero = empty batch)
+	timer := time.NewTimer(time.Hour)
 	if !timer.Stop() {
 		<-timer.C
 	}
@@ -665,6 +690,30 @@ func (w *cupsWS) sendLoop() {
 	maxBytes := w.config.BatchMaxBytes
 	if w.config.MaxCodeBytesPerBatch > 0 && (maxBytes <= 0 || w.config.MaxCodeBytesPerBatch < maxBytes) {
 		maxBytes = w.config.MaxCodeBytesPerBatch
+	}
+	idle := w.config.BatchIdleFlush
+	if idle < 0 {
+		idle = 0
+	}
+
+	// arm schedules the next flush: never later than the dwell deadline from
+	// the batch's first frame, earlier (idle) once the send queue has drained
+	// so interactive traffic does not pay the dwell.
+	arm := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		wait := time.Until(firstAt.Add(w.config.BatchTimeout))
+		if len(w.sendQueue) == 0 && idle < wait {
+			wait = idle
+		}
+		if wait < 0 {
+			wait = 0
+		}
+		timer.Reset(wait)
 	}
 
 	flush := func() {
@@ -683,6 +732,7 @@ func (w *cupsWS) sendLoop() {
 		}
 		batch = batch[:0]
 		totalBytes = 0
+		firstAt = time.Time{}
 	}
 
 	for {
@@ -695,9 +745,13 @@ func (w *cupsWS) sendLoop() {
 				flush()
 				return
 			}
+			if len(batch) == 0 {
+				firstAt = time.Now()
+			}
 			batch = append(batch, pkt)
 			totalBytes += len(pkt)
 			if len(batch) >= w.config.BatchMaxPackets || totalBytes >= maxBytes {
+				// Byte/packet cap reached: flush now, do not dwell.
 				if !timer.Stop() {
 					select {
 					case <-timer.C:
@@ -705,8 +759,8 @@ func (w *cupsWS) sendLoop() {
 					}
 				}
 				flush()
-			} else if len(batch) == 1 {
-				timer.Reset(w.config.BatchTimeout)
+			} else {
+				arm()
 			}
 		case <-timer.C:
 			flush()
@@ -740,7 +794,22 @@ func (w *cupsWS) sendBatch(batch [][]byte) error {
 
 		w.codeMu.Lock()
 		base := w.serverCode
+		baseVer := w.codeVersion
 		w.codeMu.Unlock()
+
+		// Bounded housekeeping first (at most one prune per attempt): stray
+		// copies of our block from a fuzzy apply are dead document weight the
+		// payload edit can never reach; delete one, re-read the (authoritative)
+		// baseline, then write the payload into the survivor.
+		if pruneDoc, pruneDiff, ok := buildStrayPrune(base, w.side); ok {
+			if err := w.applyOneShot(pruneDiff, pruneDoc); err != nil {
+				utils.Debugf("[CUPS] stray prune (%s) attempt %d: %v", w.auth.roomUUID[:8], attempt, err)
+			}
+			w.codeMu.Lock()
+			base, baseVer = w.serverCode, w.codeVersion
+			w.codeMu.Unlock()
+		}
+
 		newCode, diff, changed := buildBlockEdit(base, w.side, w.roomIdx, col)
 		if !changed {
 			// The authoritative baseline already carries exactly this payload
@@ -782,11 +851,60 @@ func (w *cupsWS) sendBatch(batch [][]byte) error {
 			lastErr = err
 			utils.Debugf("[CUPS] change_code (%s) attempt %d/%d rejected: %v", w.auth.roomUUID, attempt, maxChangeCodeAttempts, err)
 		}
+		// Cheap rebase before reaching for the RPC: the change_code reply's
+		// own authoritative code (adopted above) or a code_update push that
+		// arrived since our snapshot already carries a newer baseline —
+		// retry against that. shared_editor_room_info only runs when nothing
+		// has tracked the document forward (e.g. a server-side edit that
+		// never broadcast, the live case TestStaleBaselineRecovery models).
+		if fresh, ok := w.rebasedBaseline(base, baseVer); ok {
+			utils.Debugf("[CUPS] change_code (%s) attempt %d/%d rebased on the tracked push/reply (%d bytes, no RPC)", w.auth.roomUUID, attempt, maxChangeCodeAttempts, len(fresh))
+			continue
+		}
 		if rerr := w.refreshBaseline(); rerr != nil {
 			utils.Debugf("[CUPS] baseline refresh (%s): %v", w.auth.roomUUID, rerr)
 		}
 	}
 	return fmt.Errorf("change_code failed after %d attempts: %w", maxChangeCodeAttempts, lastErr)
+}
+
+// rebasedBaseline reports a baseline that reached us WITHOUT an extra RPC:
+// a code_update push (or the rejected send's own authoritative reply, which
+// the caller already adopted) carried the document past the caller's
+// snapshot — either its version moved ahead, or (unversioned servers) its
+// content did.
+func (w *cupsWS) rebasedBaseline(base string, baseVer int64) (string, bool) {
+	w.codeMu.Lock()
+	defer w.codeMu.Unlock()
+	if w.serverCode != base && (baseVer < 0 || w.codeVersion > baseVer) {
+		return w.serverCode, true
+	}
+	return "", false
+}
+
+// applyOneShot issues one housekeeping change_code (a stray prune) and
+// verifies it against the authoritative document in the reply. It is
+// best-effort: on mismatch the adopted server document simply becomes the
+// baseline the caller re-reads; no retry loop here.
+func (w *cupsWS) applyOneShot(diff, expectDoc string) error {
+	data := map[string]interface{}{
+		"diff": diff,
+		"room": w.auth.roomUUID,
+		"user": w.auth.userUUID,
+	}
+	resp, err := w.callRPC("shared_editor_change_code", data, changeRPCTimeout)
+	if err != nil {
+		return err
+	}
+	code, ver, haveCode, haveVer := parseCodeResp(resp)
+	if !haveCode {
+		return fmt.Errorf("no code in prune reply")
+	}
+	w.adoptServerCode(code, ver, haveVer)
+	if code != expectDoc {
+		return fmt.Errorf("prune not applied: server %d bytes, expected %d", len(code), len(expectDoc))
+	}
+	return nil
 }
 
 func (w *cupsWS) countSent(packets, rawBytes int, newCode string) {
@@ -1292,6 +1410,43 @@ func runeTailStart(s string, n int) int {
 	return i
 }
 
+// contiguousBlocks reports whether every block in the run sits immediately
+// after the previous block's END-line terminator: nothing foreign lies between
+// our blocks and one hunk can rewrite the whole run.
+func contiguousBlocks(blocks []cupsBlock) bool {
+	for i := 1; i < len(blocks); i++ {
+		if blocks[i-1].endTextEndByte+1 != blocks[i].beginByte {
+			return false
+		}
+	}
+	return true
+}
+
+// buildStrayPrune emits the single-hunk "-" replace that deletes the first
+// stray block of our side. A stale-baseline recovery whose patch a fuzzy
+// server apply turned into a SECOND fenced block for us must not live with
+// it: the peer reads the first complete block (extractBlockSide), so block 0
+// keeps carrying the payload and every later, foreign-separated copy is
+// document-size dead weight no data-region edit can reach (template or peer
+// text lies between). One prune per send converges the document; adjacent
+// runs never need it — buildBlockEdit already collapses those in place.
+func buildStrayPrune(doc string, side string) (string, string, bool) {
+	blocks := findBlocks(doc, side)
+	if len(blocks) < 2 || contiguousBlocks(blocks) {
+		return "", "", false
+	}
+	s := blocks[1] // keep block 0 (what the peer reads), prune the first stray
+	delEnd := s.endTextEndByte
+	if delEnd < len(doc) && doc[delEnd] == '\n' {
+		delEnd++ // the END line complete, terminator included
+	}
+	del := doc[s.beginByte:delEnd]
+	ctxBytes := runeTailStart(doc[:s.beginByte], diffContextChars)
+	ctx := doc[ctxBytes:s.beginByte]
+	newDoc := doc[:s.beginByte] + doc[delEnd:]
+	return newDoc, makeDiff(s.beginRune-utf8.RuneCountInString(ctx), ctx, del, ""), true
+}
+
 // buildBlockEdit computes (newDoc, diff, changed) for writing payloadB64 into
 // our fenced block, using the server's character-offset patch dialect. Only a
 // single contiguous region can be rewritten per hunk, which is exactly our
@@ -1304,9 +1459,9 @@ func runeTailStart(s string, n int) int {
 //     unique per side).
 //   - several contiguous    → collapse: one hunk deletes the whole run of our
 //     blocks and inserts a single fresh one.
-//   - several, not adjacent → rewrite the last one only (stale copies are
-//     pathological — a fuzzy server apply — and the authoritative response
-//     check converges them across retries).
+//   - several, not adjacent → rewrite the FIRST one (what the peer's
+//     extractBlockSide reads); sendBatch prunes the stray copies with a
+//     dedicated "-" replace before the payload write.
 //
 // changed=false means the region already holds exactly this payload: sending
 // would be a no-op patch, so the caller can skip the RPC entirely.
@@ -1348,8 +1503,11 @@ func buildBlockEdit(doc string, side string, idx int, payloadB64 string) (string
 		k++
 	}
 	if k+1 < len(blocks) {
-		utils.Debugf("[CUPS] %d blocks for side %s, only %d adjacent — rewriting the last one", len(blocks), side, k+1)
-		b := blocks[len(blocks)-1]
+		utils.Debugf("[CUPS] %d blocks for side %s, only %d adjacent — rewriting the first one", len(blocks), side, k+1)
+		// The peer reads the FIRST complete block (extractBlockSide), so the
+		// first one carries the payload; sendBatch prunes the strays on the
+		// way (buildStrayPrune) so this stays the only block.
+		b := blocks[0]
 		ctxBytes := runeTailStart(doc[:b.dataStartByte], diffContextChars)
 		ctx := doc[ctxBytes:b.dataStartByte]
 		newDoc := doc[:b.dataStartByte] + data + doc[b.dataEndByte:]
