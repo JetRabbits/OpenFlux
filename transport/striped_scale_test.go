@@ -64,9 +64,9 @@ func TestStripedThroughputScalesWithLanes(t *testing.T) {
 	// WebSocket-based transports carry much larger pieces than Telemost's
 	// 1312-byte SFU fragments. Match the piece size to what fits in one
 	// lane op (e.g. 64 KB for ShareDB's 1 MB maxPayload).
-	saved := stripePieceBytes
-	stripePieceBytes = 64 * 1024
-	defer func() { stripePieceBytes = saved }()
+	saved := stripePieceBytes()
+	setStripePieceBytes(64 * 1024)
+	defer setStripePieceBytes(saved)
 
 	for _, nLanes := range []int{1, 2, 4, 8} {
 		t.Run(fmt.Sprintf("%d-lanes", nLanes), func(t *testing.T) {

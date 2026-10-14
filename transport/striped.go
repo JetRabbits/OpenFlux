@@ -127,34 +127,67 @@ func envMs(name string, def int) time.Duration {
 }
 
 var (
-	// stripePieceBytes is the most a piece carries: one lane fragment
-	// (TELEMOST_FRAG_BYTES minus its 8-byte header) minus the stripe header
-	// and flag, so every piece is exactly one lane packet.
-	stripePieceBytes = envIntOr("STRIPE_PIECE_BYTES", envIntOr("TELEMOST_FRAG_BYTES", 1312)-8-stripeHeader-1)
-
 	// ackInterval is how often the receiver acks while data flows.
 	ackInterval = envMs("STRIPE_ACK_MS", 10)
 
-	// holeDeadline is how long a hole may hold later frames back before it is
-	// given up on. Retransmission normally fills it in one or two round trips,
-	// but the SFU now and then stops forwarding every lane for a few seconds
-	// (it renegotiates the subscriptions when someone joins or leaves); the
-	// tunnel's TCP waits that out (see tcpMinRTO) and loses nothing.
-	holeDeadline = envMs("STRIPE_HOLE_MS", 5000)
-
-	// CoDel on the shared send queue: when the oldest frame has waited longer
-	// than codelTarget for a whole codelInterval, drop at the head, faster
-	// while it lasts. The carrier's rate swings by half from second to second
-	// and the tunnel's round trip is 100-500 ms: with a 30 ms target every
-	// swing cost TCP a drop and seconds of regrowth (between two phones, 3
-	// lanes: 1.2-1.7 MB/s on average against 3.0-3.2 with these values, the
-	// same lanes and pacing).
-	codelTarget   = envMs("STRIPE_CODEL_TARGET_MS", 150)
+	// CoDel on the shared send queue drops at the head for a whole
+	// codelInterval when the queue sits over codelTarget too long.
 	codelInterval = envMs("STRIPE_CODEL_INTERVAL_MS", 600)
 
 	// sendQueueLimit bounds the send queue (bytes) whatever CoDel decides.
 	sendQueueLimit = envIntOr("STRIPE_QUEUE_BYTES", 4<<20)
 )
+
+// stripePieceBytes, holeDeadline and codelTarget are read on the transports'
+// pump/ack/stats goroutines, and the tests in this package retune them while
+// earlier tests' straggler goroutines may still be pumping the same test
+// binary — plain vars there are a data race (CI -race caught a scale-test
+// write against (*sender).codelShouldDrop's read). They live in atomics
+// behind the typed accessors below; the env vars are still read exactly once
+// at init, with the same defaults, and giveUpAfter still freezes from that
+// initial holeDeadline (reconfiguring holeDeadline never moves it).
+var (
+	stripePieceBytesV atomic.Uint64 // bytes, via stripePieceBytes()/setStripePieceBytes()
+	holeDeadlineV     atomic.Uint64 // ns, via holeDeadline()/setHoleDeadline()
+	codelTargetV      atomic.Uint64 // ns, via codelTarget()/setCodelTarget()
+)
+
+func init() {
+	hd := envMs("STRIPE_HOLE_MS", 5000)
+	stripePieceBytesV.Store(uint64(envIntOr("STRIPE_PIECE_BYTES", envIntOr("TELEMOST_FRAG_BYTES", 1312)-8-stripeHeader-1)))
+	holeDeadlineV.Store(uint64(hd))
+	codelTargetV.Store(uint64(envMs("STRIPE_CODEL_TARGET_MS", 150)))
+	giveUpAfter = hd + 3*time.Second
+}
+
+// stripePieceBytes is the most a piece carries: one lane fragment
+// (TELEMOST_FRAG_BYTES minus its 8-byte header) minus the stripe header
+// and flag, so every piece is exactly one lane packet.
+func stripePieceBytes() int { return int(stripePieceBytesV.Load()) }
+
+// holeDeadline is how long a hole may hold later frames back before it is
+// given up on. Retransmission normally fills it in one or two round trips,
+// but the SFU now and then stops forwarding every lane for a few seconds
+// (it renegotiates the subscriptions when someone joins or leaves); the
+// tunnel's TCP waits that out (see tcpMinRTO) and loses nothing.
+func holeDeadline() time.Duration { return time.Duration(holeDeadlineV.Load()) }
+
+// codelTarget is CoDel's queue-delay target: when the oldest frame has
+// waited longer than codelTarget for a whole codelInterval, drop at the
+// head, faster while it lasts. The carrier's rate swings by half from
+// second to second and the tunnel's round trip is 100-500 ms: with a 30 ms
+// target every swing cost TCP a drop and seconds of regrowth (between two
+// phones, 3 lanes: 1.2-1.7 MB/s on average against 3.0-3.2 with these
+// values, the same lanes and pacing).
+func codelTarget() time.Duration { return time.Duration(codelTargetV.Load()) }
+
+// The setters exist for the tests in this package (which tune these knobs
+// for whole tests, as the env vars tune them for a process); a store lands
+// atomically for every goroutine reading through the accessors.
+
+func setStripePieceBytes(n int)       { stripePieceBytesV.Store(uint64(n)) }
+func setHoleDeadline(d time.Duration) { holeDeadlineV.Store(uint64(d)) }
+func setCodelTarget(d time.Duration)  { codelTargetV.Store(uint64(d)) }
 
 // laneReorderSlack: a piece counts as lost once a piece that left more than
 // this many transmissions after it on the same lane has been acked. A lane is
@@ -674,7 +707,7 @@ func (s *StripedTransport) autoscaleLoop() {
 		ceilingAt       time.Time
 		rateBefore      float64
 	)
-	kbs := func(pieces float64) float64 { return pieces * float64(stripePieceBytes) / 1000 }
+	kbs := func(pieces float64) float64 { return pieces * float64(stripePieceBytes()) / 1000 }
 	for {
 		select {
 		case <-s.done:
@@ -1013,8 +1046,8 @@ func (q *sender) nextPiece(now time.Time) []byte {
 		q.cur, q.curStarted = f, false
 	}
 	n := len(q.cur)
-	if n > stripePieceBytes {
-		n = stripePieceBytes
+	if pb := stripePieceBytes(); n > pb {
+		n = pb
 	}
 	flag := byte(0)
 	if q.curStarted {
@@ -1054,7 +1087,7 @@ func (q *sender) dequeue(now time.Time) ([]byte, bool) {
 
 func (q *sender) codelShouldDrop(sojourn time.Duration, now time.Time) bool {
 	okToDrop := false
-	if sojourn < codelTarget || q.queueBytes < 2*stripePieceBytes {
+	if sojourn < codelTarget() || q.queueBytes < 2*stripePieceBytes() {
 		q.codelFirstAbove = time.Time{}
 	} else if q.codelFirstAbove.IsZero() {
 		q.codelFirstAbove = now.Add(codelInterval)
@@ -1247,10 +1280,11 @@ func (q *sender) detectLocked(now time.Time) bool {
 	return added
 }
 
-// giveUpAfter is how long the sender keeps resending a piece: longer than the
-// receiver waits on a hole (holeDeadline), so a live receiver has given up
-// on it first.
-var giveUpAfter = holeDeadline + 3*time.Second
+// giveUpAfter is how long the sender keeps resending a piece: longer than
+// the receiver waits on a hole (holeDeadline), so a live receiver has given
+// up on it first. Frozen from the env-derived holeDeadline at init (see the
+// knob block above): tests retune holeDeadline without moving this.
+var giveUpAfter time.Duration
 
 // tickLanes rolls the lanes' loss figures.
 func (q *sender) tickLanes(now time.Time) {
@@ -1371,7 +1405,7 @@ type reorderOut struct {
 }
 
 func newReorderBuffer(deliver func([]byte, bool)) *reorderBuffer {
-	r := &reorderBuffer{deadline: holeDeadline, ring: make([]reorderSlot, reorderWindow), out: make(chan reorderOut, 8192)}
+	r := &reorderBuffer{deadline: holeDeadline(), ring: make([]reorderSlot, reorderWindow), out: make(chan reorderOut, 8192)}
 	go func() {
 		for o := range r.out {
 			deliver(o.b, o.gap)

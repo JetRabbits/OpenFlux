@@ -9,9 +9,9 @@ import (
 )
 
 func TestReorderBufferOrderAndSkip(t *testing.T) {
-	old := holeDeadline
-	holeDeadline = 100 * time.Millisecond
-	defer func() { holeDeadline = old }()
+	old := holeDeadline()
+	setHoleDeadline(100 * time.Millisecond)
+	defer setHoleDeadline(old)
 	var mu sync.Mutex
 	var got []byte
 	r := newReorderBuffer(func(b []byte, _ bool) { mu.Lock(); got = append(got, b[0]); mu.Unlock() })
@@ -92,9 +92,9 @@ func (l *lossyLane) IsConnected() bool       { return true }
 func (l *lossyLane) Stats() TransportStats   { return TransportStats{Connected: true} }
 
 func TestStripedARQRecoversLoss(t *testing.T) {
-	old := codelTarget
-	codelTarget = time.Minute // this is about retransmission, not queue management
-	defer func() { codelTarget = old }()
+	old := codelTarget()
+	setCodelTarget(time.Minute) // this is about retransmission, not queue management
+	defer setCodelTarget(old)
 	const lanes, frames = 3, 3000
 	var aLanes, bLanes []Transport
 	for i := 0; i < lanes; i++ {
