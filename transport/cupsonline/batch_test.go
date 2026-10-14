@@ -297,14 +297,17 @@ delivered:
 
 func TestDefaultBatchingConfig(t *testing.T) {
 	c := DefaultCupsonlineConfig()
-	if c.BatchTimeout != 70*time.Millisecond {
-		t.Errorf("BatchTimeout = %v, want 70ms dwell", c.BatchTimeout)
+	if c.BatchTimeout != 30*time.Millisecond {
+		t.Errorf("BatchTimeout = %v, want 30ms dwell", c.BatchTimeout)
 	}
 	if c.BatchIdleFlush != 12*time.Millisecond {
 		t.Errorf("BatchIdleFlush = %v, want 12ms", c.BatchIdleFlush)
 	}
 	if c.MaxCodeBytesPerBatch != 12288 {
 		t.Errorf("MaxCodeBytesPerBatch = %d, want 12288", c.MaxCodeBytesPerBatch)
+	}
+	if c.MaxInflightBatches != 3 {
+		t.Errorf("MaxInflightBatches = %d, want 3 (pipelined write window)", c.MaxInflightBatches)
 	}
 }
 

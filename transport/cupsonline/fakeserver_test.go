@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
@@ -62,6 +63,24 @@ type fakeRoom struct {
 	noop     int // change_code calls whose patch did not match (silent no-op)
 
 	roomInfo int // shared_editor_room_info calls for this room
+	calls    int // shared_editor_change_code calls seen
+
+	// ---- pipelined-writer test knobs (guarded by mu; zero/nil = off) ----
+
+	// replyDelays holds back the change_code REPLY of the k-th call (the
+	// last entry repeats) while the code_update push of that call goes out
+	// immediately — the server still applies calls in arrival order, but the
+	// RPC responses reach the writer late and possibly out of order, the
+	// way concurrent Django workers can deliver them.
+	replyDelays []time.Duration
+	// gate, when non-nil, makes every change_code reply wait for a token
+	// (push unaffected) — the writer's in-flight window starves unless it
+	// keeps consuming replies.
+	gate chan struct{}
+	// forceNoop silently no-ops the next N calls whose patch WOULD apply —
+	// a deterministic "server did not apply your write" for the writer's
+	// first pipelined send.
+	forceNoop int
 }
 
 type fakeServer struct {
@@ -185,6 +204,48 @@ func (f *fakeServer) roomInfoCount(uuid string) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.roomInfo
+}
+
+// callCount is how many shared_editor_change_code calls the room has seen
+// (applied, no-oped and rejected alike).
+func (f *fakeServer) callCount(uuid string) int {
+	r := f.roomObj(uuid)
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+// setReplyDelays arms out-of-order/late RPC responses: the reply of call k is
+// held for ds[min(k, len(ds)-1)] while its push goes out at commit time.
+func (f *fakeServer) setReplyDelays(uuid string, ds ...time.Duration) {
+	if r := f.roomObj(uuid); r != nil {
+		r.mu.Lock()
+		r.replyDelays = ds
+		r.mu.Unlock()
+	}
+}
+
+// setGate arms a reply gate: every change_code reply waits for a token from
+// ch (or ch being closed); pushes stay immediate.
+func (f *fakeServer) setGate(uuid string, ch chan struct{}) {
+	if r := f.roomObj(uuid); r != nil {
+		r.mu.Lock()
+		r.gate = ch
+		r.mu.Unlock()
+	}
+}
+
+// setForceNoop arms deterministic rejections: the next n change_code calls
+// are silently no-oped even though their patch matches the stored document.
+func (f *fakeServer) setForceNoop(uuid string, n int) {
+	if r := f.roomObj(uuid); r != nil {
+		r.mu.Lock()
+		r.forceNoop = n
+		r.mu.Unlock()
+	}
 }
 
 func (f *fakeServer) codeOf(uuid string) string {
@@ -379,6 +440,12 @@ func (p *fakePeer) serveRPC(id int64, method string, data json.RawMessage) {
 			}})
 			return
 		}
+		if applied && room.forceNoop > 0 {
+			room.forceNoop-- // test knob: pretend the (matching) patch misfired
+			applied = false
+		}
+		callIdx := room.calls
+		room.calls++
 		if applied {
 			room.code = newCode
 			room.applied++
@@ -388,16 +455,40 @@ func (p *fakePeer) serveRPC(id int64, method string, data json.RawMessage) {
 		room.version++
 		ver := room.version
 		codeNow := room.code
+		delay := time.Duration(0)
+		if n := len(room.replyDelays); n > 0 {
+			if callIdx >= n {
+				callIdx = n - 1
+			}
+			delay = room.replyDelays[callIdx]
+		}
+		gate := room.gate
 		subs := make([]*fakePeer, 0, len(room.subs))
 		for sp := range room.subs {
 			subs = append(subs, sp)
 		}
 		room.mu.Unlock()
-		// Reply carries the FULL stored document (observed live shape:
-		// {"id":N,"rpc":{"data":{"uuid","code",...}}}).
-		p.send(map[string]interface{}{"id": id, "rpc": map[string]interface{}{"data": map[string]interface{}{
+		// The reply carries the FULL stored document as of this call's commit
+		// (observed live shape: {"id":N,"rpc":{"data":{"uuid","code",...}}}).
+		// Test knobs may hold it back (late / gated, hence possibly OUT OF
+		// ORDER across calls) — concurrent server workers do exactly that.
+		reply := map[string]interface{}{"id": id, "rpc": map[string]interface{}{"data": map[string]interface{}{
 			"uuid": d.Room, "code": codeNow, "version": ver,
-		}}})
+		}}}
+		if delay > 0 || gate != nil {
+			go func() {
+				if delay > 0 {
+					time.Sleep(delay)
+				}
+				if gate != nil {
+					<-gate // closed channel releases every waiter (test cleanup)
+				}
+				p.send(reply)
+			}()
+		} else {
+			p.send(reply)
+		}
+		// Pushes still follow the commit synchronously, in apply order.
 		for _, sp := range subs {
 			sp.send(map[string]interface{}{"push": map[string]interface{}{
 				"channel": ch,

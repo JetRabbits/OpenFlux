@@ -25,6 +25,14 @@
 // rejected with a 400 and nothing relays. The code-editing RPC above is the
 // live replacement observed in a real browser protocol capture: it still
 // accepts arbitrary percent-encoded text and still broadcasts to everyone.
+//
+// The writer PIPELINES: up to MaxInflightBatches change_code calls ride the
+// wire at once per channel, each built optimistically on the predicted
+// document of the writes still in flight, replies applied asynchronously by
+// version monotonicity, one rebase+retransmit for a write the server did not
+// apply. The wire format (diff dialect, framing, chunking) is untouched —
+// only the scheduling changed, so old clients interop, they just pipeline
+// less.
 package cupsonline
 
 import (
@@ -97,6 +105,17 @@ type CupsonlineConfig struct {
 	// ~30KB document.
 	BatchTimeout time.Duration
 
+	// MaxInflightBatches is the per-channel write window: how many
+	// change_code calls may be OUTSTANDING (sent, reply not yet processed)
+	// at once. The writer no longer blocks on one call's reply before
+	// dispatching the next — responses are applied asynchronously by version
+	// monotonicity, and a write that the server did not apply gets one
+	// rebase+retransmit while the rest of the window proceeds. When the
+	// window is full the send loop stops draining the queue, so backpressure
+	// upstream is exactly what a serial writer produced. 1 = the old
+	// stop-and-wait schedule.
+	MaxInflightBatches int
+
 	// BatchIdleFlush flushes a partially filled batch this long after the
 	// last frame when the send queue has drained (interactive traffic:
 	// browsing must not pay the full dwell). A still-arriving stream keeps
@@ -147,8 +166,16 @@ func DefaultCupsonlineConfig() CupsonlineConfig {
 		// browsing) from waiting out the dwell.
 		BatchMaxPackets: 64,
 		BatchMaxBytes:   32 * 1024,
-		BatchTimeout:    70 * time.Millisecond,
+		BatchTimeout:    30 * time.Millisecond,
 		BatchIdleFlush:  12 * time.Millisecond,
+
+		// Three writes in flight per channel: a tunnel RTT through the exit
+		// is 0.5-1 s, and a stop-and-wait writer spends one whole RTT per
+		// change_code call (measured: 2.3-3.8 s TTFB idle for a 100-byte
+		// HTTPS request, 4-6 RTTs of handshake pipelined through it). A
+		// window of 3 lets the next batches ride while one call is still in
+		// the air.
+		MaxInflightBatches: 3,
 
 		MaxCodeBytesPerBatch: 12288,
 
@@ -442,6 +469,13 @@ type cupsWS struct {
 	serverCode  string
 	codeVersion int64
 
+	// connGen counts websockets installed by connectAndServe. A pipelined
+	// write carries the generation it was dispatched on; a reply or a
+	// baseline prediction from an older generation is stale the moment the
+	// number moves (the send loop re-derives everything from the fresh
+	// fetchBaselineInline document).
+	connGen atomic.Uint64
+
 	// RPC reply correlation: callRPC registers a reply channel under the
 	// frame id; the read loop routes {"id":N,...} frames here.
 	pendingMu sync.Mutex
@@ -472,9 +506,11 @@ var errWSReset = fmt.Errorf("websocket reconnected")
 
 func (w *cupsWS) nextID() int64 { return w.rpcID.Add(1) }
 
-// callRPC sends one Centrifugo RPC frame and waits for the reply correlated by
-// frame id. Replies arrive through the read loop (handleMessage → pending).
-func (w *cupsWS) callRPC(method string, data map[string]interface{}, timeout time.Duration) (json.RawMessage, error) {
+// sendRPCAsync sends one Centrifugo RPC frame and returns IMMEDIATELY: the
+// reply (or, if the websocket dies first, the error clearPending manufactures
+// for every outstanding call) arrives on the returned channel. The caller owns
+// it; nothing here waits for the round trip.
+func (w *cupsWS) sendRPCAsync(method string, data map[string]interface{}) (int64, chan rpcResp, error) {
 	id := w.nextID()
 	ch := make(chan rpcResp, 1)
 	w.pendingMu.Lock()
@@ -483,19 +519,33 @@ func (w *cupsWS) callRPC(method string, data map[string]interface{}, timeout tim
 	}
 	w.pending[id] = ch
 	w.pendingMu.Unlock()
-	defer func() {
-		w.pendingMu.Lock()
-		delete(w.pending, id)
-		w.pendingMu.Unlock()
-	}()
 
 	msg := map[string]interface{}{
 		"rpc": map[string]interface{}{"method": method, "data": data},
 		"id":  id,
 	}
 	if err := w.writeJSON(msg); err != nil {
+		w.pendingMu.Lock()
+		delete(w.pending, id)
+		w.pendingMu.Unlock()
+		return 0, nil, err
+	}
+	return id, ch, nil
+}
+
+// callRPC sends one Centrifugo RPC frame and waits for the reply correlated by
+// frame id. Replies arrive through the read loop (handleMessage → pending).
+func (w *cupsWS) callRPC(method string, data map[string]interface{}, timeout time.Duration) (json.RawMessage, error) {
+	id, ch, err := w.sendRPCAsync(method, data)
+	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		w.pendingMu.Lock()
+		delete(w.pending, id)
+		w.pendingMu.Unlock()
+	}()
+
 	select {
 	case r := <-ch:
 		return r.data, r.err
@@ -633,6 +683,10 @@ func (w *cupsWS) connectAndServe() error {
 	if err := w.fetchBaselineInline(conn); err != nil {
 		return err
 	}
+	// Publish the generation BEFORE connected: a pipelined write may only be
+	// dispatched while connected is true, and it then tags the current
+	// generation, so a write can never outlive the baseline it was built on.
+	w.connGen.Add(1)
 	w.connected.Store(true)
 	utils.Debugf("[CUPS] WS ready: %s", w.auth.roomUUID)
 
@@ -676,7 +730,54 @@ func (w *cupsWS) keepAliveLoop(stop chan struct{}) {
 	}
 }
 
+// pendingWrite is one change_code write queued for, or on, the pipelined
+// wire: a payload batch, or a stray-block prune riding ahead of one. The
+// send-loop goroutine owns everything about it except the fields the
+// completion handler reads after the reply arrives.
+type pendingWrite struct {
+	id        int64    // rpc frame id of the CURRENT wire attempt
+	seq       uint64   // position in the ordered dispatch queue
+	batch     [][]byte // payload; nil for prune writes
+	rawBytes  int      // payload bytes (stats)
+	predicted string   // full document the server must hold once this write lands
+	base      string   // document the diff was computed against
+	baseVer   int64
+	attempts  int // wire attempts made (0 = never dispatched)
+	gen       uint64
+	prune     bool
+}
+
+type sendCompletion struct {
+	id int64
+	r  rpcResp
+}
+
+// sendLoop batches the send queue and drives the pipelined writer: up to
+// MaxInflightBatches change_code calls are outstanding at a time, each next
+// batch is built optimistically on the predicted document of the writes still
+// in flight, and replies are processed asynchronously — out of order, adopted
+// only by version monotonicity (adoptServerCode refuses anything older than
+// the applied baseline). A write the server did not apply (silent no-op,
+// rejected, lost connection) gets exactly ONE rebase+retransmit through the
+// ordered dispatch queue while the rest of the window proceeds; if even that
+// comes back unapplied, the batch falls to the old blocking sendBatch ladder
+// (with its room_info refresh) as a last resort. Only the WIRE is pipelined:
+// the dispatch queue keeps writes in batch order, and when the window is full
+// the loop stops draining sendQueue, so upstream backpressure is exactly what
+// the serial writer had.
+//
+// The small-packet fast path is the BatchIdleFlush arm of the batch timer: an
+// isolated frame over a drained queue flushes after the idle wait (12 ms)
+// instead of the full dwell — verified by TestIsolatedSendFlushesPromptly and
+// TestPipelinedLatencyNoBacklog. Prioritising small frames ahead of queued
+// bulk bytes would need per-frame classes the wire format does not carry;
+// under bulk load the 30 ms dwell already bounds the wait.
 func (w *cupsWS) sendLoop() {
+	window := w.config.MaxInflightBatches
+	if window < 1 {
+		window = 1
+	}
+
 	batch := make([][]byte, 0, w.config.BatchMaxPackets)
 	totalBytes := 0
 	var firstAt time.Time // when the batch's first frame arrived (zero = empty batch)
@@ -716,35 +817,261 @@ func (w *cupsWS) sendLoop() {
 		timer.Reset(wait)
 	}
 
-	flush := func() {
+	// ---- pipelined writer state, owned by THIS goroutine ----
+	var seqCounter uint64
+	nextSeq := func() uint64 { seqCounter++; return seqCounter }
+
+	inflight := make(map[int64]*pendingWrite, window+2)
+	var dispatchQ []*pendingWrite // formed writes awaiting the wire, ordered by seq
+	overlayTip := ""              // predicted doc after ALL dispatched writes ("" = no chain)
+	var tipGen uint64             // connGen overlayTip was built on
+	completions := make(chan sendCompletion, 2*window+8)
+	retry := time.NewTicker(20 * time.Millisecond) // re-check dispatch when a write cannot go out yet
+	defer retry.Stop()
+
+	// startWrite puts one write on the wire and arranges for its reply to
+	// land on completions. The send loop never waits for it here; the reply
+	// is bounded by the same changeRPCTimeout the serial ladder gave every
+	// call, so a hung server worker cannot pin a window slot forever.
+	startWrite := func(pw *pendingWrite, diff string) bool {
+		id, ch, err := w.sendRPCAsync("shared_editor_change_code", map[string]interface{}{
+			"diff": diff,
+			"room": w.auth.roomUUID,
+			"user": w.auth.userUUID,
+		})
+		if err != nil {
+			utils.Debugf("[CUPS] change_code dispatch (%s): %v", w.auth.roomUUID, err)
+			return false
+		}
+		pw.id = id
+		pw.attempts++
+		inflight[id] = pw
+		go func() {
+			select {
+			case r := <-ch:
+				select {
+				case completions <- sendCompletion{id: id, r: r}:
+				case <-w.ctx:
+				}
+			case <-time.After(changeRPCTimeout):
+				w.pendingMu.Lock()
+				delete(w.pending, id)
+				w.pendingMu.Unlock()
+				select {
+				case completions <- sendCompletion{id: id, r: rpcResp{err: fmt.Errorf("rpc change_code timeout (id %d)", id)}}:
+				case <-w.ctx:
+				}
+			case <-w.ctx:
+			}
+		}()
+		return true
+	}
+
+	// insertBySeq re-enters a failed write at its ordering position, so a
+	// retransmit of batch k is always dispatched before batch k+1's fresh
+	// write (the queue stays ordered; only the wire pipelines).
+	insertBySeq := func(pw *pendingWrite) {
+		i := len(dispatchQ)
+		for i > 0 && dispatchQ[i-1].seq > pw.seq {
+			i--
+		}
+		dispatchQ = append(dispatchQ, nil)
+		copy(dispatchQ[i+1:], dispatchQ[i:])
+		dispatchQ[i] = pw
+	}
+
+	confirmWrite := func(pw *pendingWrite) {
+		if pw.batch != nil {
+			w.countSent(len(pw.batch), pw.rawBytes, pw.predicted)
+		}
+	}
+
+	// failWrite handles a write that did not come back applied. The
+	// optimistic chain dies with the broken expectation (the next dispatch
+	// rebases on the authoritative baseline); the payload gets its ONE
+	// async rebase+retransmit — re-derived against whatever the baseline is
+	// AT DISPATCH TIME, so several failures in flight rebase independently
+	// and converge in queue order. After that the old serial ladder owns
+	// the batch, retries and final drop included.
+	failWrite := func(pw *pendingWrite) {
+		overlayTip = ""
+		if pw.prune {
+			// Housekeeping write: strays are re-detected at the next payload
+			// dispatch (at most one prune per payload write, exactly as the
+			// serial ladder budgeted), so a lost prune needs no requeue.
+			return
+		}
+		if pw.attempts < 2 {
+			insertBySeq(pw) // the ONE rebase+retransmit
+			return
+		}
+		if err := w.sendBatch(pw.batch); err != nil {
+			utils.Debugf("[CUPS] legacy resend after pipeline (%s): %v", w.auth.roomUUID, err)
+		}
+	}
+
+	handleCompletion := func(c sendCompletion) {
+		pw, ok := inflight[c.id]
+		if !ok {
+			return
+		}
+		delete(inflight, c.id)
+
+		if pw.gen != w.connGen.Load() {
+			// The websocket was replaced under this write (clearPending
+			// manufactured the error): the attempt was not spent and there is
+			// nothing authoritative to adopt — requeue for the fresh baseline.
+			if pw.attempts > 0 {
+				pw.attempts--
+			}
+			failWrite(pw)
+			return
+		}
+		if c.r.err != nil {
+			utils.Debugf("[CUPS] change_code (%s) rejected: %v", w.auth.roomUUID, c.r.err)
+			failWrite(pw)
+			return
+		}
+		code, ver, haveCode, haveVer := parseCodeResp(c.r.data)
+		if haveCode {
+			// The reply's code is the authoritative document for this
+			// channel. Replies may arrive out of order: adoption is version
+			// monotonic, an older reply can never roll the baseline back.
+			w.adoptServerCode(code, ver, haveVer)
+			if code == pw.predicted {
+				confirmWrite(pw)
+				return
+			}
+			// Silent no-op / fuzzy apply: our patch did not land as predicted.
+			utils.Debugf("[CUPS] change_code (%s) not applied: server doc %d bytes, predicted %d",
+				w.auth.roomUUID, len(code), len(pw.predicted))
+			failWrite(pw)
+			return
+		}
+		// No code in the reply: the old optimistic (guarded) promotion.
+		w.applyChangeSuccess(pw.base, pw.predicted, c.r.data)
+		confirmWrite(pw)
+	}
+
+	// dispatchHead puts queued writes on the wire while the window has room,
+	// strictly in queue order. Payload diffs are built at DISPATCH time, on
+	// the freshest baseline or the optimistic tip — so a retransmit is always
+	// rebased on what the server is known to hold right then.
+	dispatchHead := func() {
+		for len(dispatchQ) > 0 && len(inflight) < window && w.connected.Load() {
+			pw := dispatchQ[0]
+			gen := w.connGen.Load()
+
+			w.codeMu.Lock()
+			base, baseVer := w.serverCode, w.codeVersion
+			w.codeMu.Unlock()
+			chained := false
+			if overlayTip != "" {
+				if tipGen == gen {
+					base = overlayTip
+					chained = true
+				} else {
+					overlayTip = ""
+				}
+			}
+
+			if !chained {
+				// Bounded housekeeping ahead of the payload (at most one
+				// prune per payload write): stray copies of our block from an
+				// earlier fuzzy apply are dead document weight this frame's
+				// data-region edit can never reach. The prune rides as its own
+				// pipelined write and the payload chains onto its prediction;
+				// if the prune write is itself lost, the next dispatch
+				// re-detects the strays.
+				if pDoc, pDiff, ok := buildStrayPrune(base, w.side); ok {
+					pr := &pendingWrite{seq: nextSeq(), prune: true, predicted: pDoc, base: base, baseVer: baseVer, gen: gen}
+					if startWrite(pr, pDiff) {
+						overlayTip = pDoc
+						tipGen = gen
+						continue // rebuild the payload against the pruned prediction
+					}
+				}
+			}
+
+			col, rawTotal := framePackets(pw.batch)
+			colB64 := base64.RawStdEncoding.EncodeToString(col)
+			newCode, diff, changed := buildBlockEdit(base, w.side, w.roomIdx, colB64)
+			if !changed {
+				// The baseline we are building on already carries exactly this
+				// payload in our block. Building on the confirmed baseline it
+				// means the bytes are on the server (and were pushed: the peer
+				// dedupes identical peer blocks, so even a real RPC could not
+				// deliver them again); building on the tip means an in-flight
+				// write already carries them. Either way, account and drop.
+				dispatchQ = dispatchQ[1:]
+				w.countSent(len(pw.batch), rawTotal, base)
+				continue
+			}
+			pw.base, pw.baseVer = base, baseVer
+			pw.predicted = newCode
+			pw.rawBytes = rawTotal
+			pw.gen = gen
+			if !startWrite(pw, diff) {
+				break // the websocket went away under us; the retry tick retries
+			}
+			dispatchQ = dispatchQ[1:]
+			overlayTip = newCode
+			tipGen = gen
+		}
+	}
+
+	// wrap closes the forming batch into the ordered dispatch queue.
+	wrap := func() {
 		if len(batch) == 0 {
 			return
 		}
-		for !w.connected.Load() {
-			select {
-			case <-w.ctx:
-				return
-			case <-time.After(20 * time.Millisecond):
-			}
-		}
-		if err := w.sendBatch(batch); err != nil {
-			utils.Debugf("[CUPS] batch send (%s): %v", w.auth.roomUUID, err)
-		}
-		batch = batch[:0]
+		dispatchQ = append(dispatchQ, &pendingWrite{seq: nextSeq(), batch: batch})
+		batch = make([][]byte, 0, w.config.BatchMaxPackets)
 		totalBytes = 0
 		firstAt = time.Time{}
 	}
 
 	for {
+		// Push everything ready: process arrived replies, then the wire.
+		for {
+			select {
+			case c := <-completions:
+				handleCompletion(c)
+				continue
+			default:
+			}
+			if len(dispatchQ) > 0 && len(inflight) < window && w.connected.Load() {
+				before := len(dispatchQ)
+				dispatchHead()
+				if len(dispatchQ) < before {
+					continue
+				}
+			}
+			break
+		}
+
+		// Window full or queued writes waiting: do not drain the send queue —
+		// Send() blocks upstream exactly as it did on the serial writer.
+		var drain chan []byte
+		if len(dispatchQ) == 0 && len(inflight) < window {
+			drain = w.sendQueue
+		}
+		var retryC <-chan time.Time
+		if len(dispatchQ) > 0 {
+			retryC = retry.C
+		}
+
 		select {
 		case <-w.ctx:
-			flush()
-			return
-		case pkt, ok := <-w.sendQueue:
-			if !ok {
-				flush()
-				return
+			// Best effort, like the old final flush: put whatever is queued
+			// on the wire (the server commits what arrives even if our side
+			// is already closing) and go.
+			wrap()
+			if w.connected.Load() {
+				dispatchHead()
 			}
+			return
+		case pkt := <-drain:
 			if len(batch) == 0 {
 				firstAt = time.Now()
 			}
@@ -758,28 +1085,33 @@ func (w *cupsWS) sendLoop() {
 					default:
 					}
 				}
-				flush()
+				wrap()
 			} else {
 				arm()
 			}
 		case <-timer.C:
-			flush()
+			wrap()
+		case c := <-completions:
+			handleCompletion(c)
+		case <-retryC:
 		}
 	}
 }
 
-// sendBatch smuggles the batch into the room's shared code document: our block
-// (at the document tail) is replaced with the base64 of the length-prefixed
-// batch framing, and the resulting character-offset patch (makeDiff) is sent
-// via the shared_editor_change_code RPC. The server applies the patch only if
-// its chunks match verbatim at the rune offsets — a stale baseline does NOT
-// error: it silently no-ops and bumps the version — so the accepted reply's
-// authoritative "code" (the full new document, observed live) is compared
-// against our expectation; on mismatch, or a hard rpc error, we refetch
-// room_info and recompute against the fresh document (bounded retries, then
-// drop + error like before). Packets are never fragmented across calls — one
-// batch either lands whole or is retried/dropped, so the peer never sees a
-// torn framing stream.
+// sendBatch is the legacy serial ladder, now the LAST resort behind the
+// pipelined writer: a batch whose original send and its single async
+// rebase+retransmit both came back unapplied runs this full loop — refetch
+// room_info when nothing has tracked the document forward, recompute, retry
+// (bounded), then drop + error like before. It smuggles the batch into the
+// room's shared code document: our block (at the document tail) is replaced
+// with the base64 of the length-prefixed batch framing, and the resulting
+// character-offset patch (makeDiff) is sent via the shared_editor_change_code
+// RPC. The server applies the patch only if its chunks match verbatim at the
+// rune offsets — a stale baseline does NOT error: it silently no-ops and
+// bumps the version — so the accepted reply's authoritative "code" (the full
+// new document, observed live) is compared against our expectation. Packets
+// are never fragmented across calls — one batch either lands whole or is
+// retried/dropped, so the peer never sees a torn framing stream.
 func (w *cupsWS) sendBatch(batch [][]byte) error {
 	payload, totalRaw := framePackets(batch)
 	col := base64.RawStdEncoding.EncodeToString(payload)
