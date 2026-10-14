@@ -1337,6 +1337,12 @@ func (q *sender) snapshot() senderStats {
 type reorderBuffer struct {
 	mu      sync.Mutex
 	started bool
+	// deadline is holeDeadline captured at construction: a buffer that
+	// outlives its transport must not read the package-level knob while a
+	// test (or a future reconfigure) rewrites it — that race showed up as a
+	// flaky -race failure between reorder tests.
+	deadline time.Duration
+
 	next    uint32
 	hi      uint32 // highest seq seen
 	gen     uint64 // bumped by every new piece
@@ -1365,7 +1371,7 @@ type reorderOut struct {
 }
 
 func newReorderBuffer(deliver func([]byte, bool)) *reorderBuffer {
-	r := &reorderBuffer{ring: make([]reorderSlot, reorderWindow), out: make(chan reorderOut, 8192)}
+	r := &reorderBuffer{deadline: holeDeadline, ring: make([]reorderSlot, reorderWindow), out: make(chan reorderOut, 8192)}
 	go func() {
 		for o := range r.out {
 			deliver(o.b, o.gap)
@@ -1488,7 +1494,7 @@ func (r *reorderBuffer) run(done chan struct{}) {
 		for r.count > 0 {
 			low := r.lowestLocked(r.next + reorderWindow)
 			waited := time.Since(r.ring[low%reorderWindow].at)
-			if waited <= holeDeadline {
+			if waited <= r.deadline {
 				break
 			}
 			utils.Infof("[STRIPE] gave up on %d piece(s) from seq %d after %s", low-r.next, r.next, waited.Round(time.Millisecond))
