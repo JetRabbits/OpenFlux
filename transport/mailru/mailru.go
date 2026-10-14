@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -25,32 +24,10 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/JetRabbits/OpenFlux/netbind"
 	"github.com/JetRabbits/OpenFlux/transport"
 	"github.com/JetRabbits/OpenFlux/utils"
 )
-
-// infoThrottle remembers when each throttled status line last fired.
-//
-// Upstream gates these lines with utils.Infof / utils.Throttled; this fork's
-// utils package has neither (only rate-limited Debugf), so the same
-// "always-visible status line, at most once per every per key" semantics
-// live here instead. They write through the standard log, which
-// utils.SetOutput redirects into the mobile app's log sink.
-var infoThrottle sync.Map // key -> time.Time
-
-func throttled(key string, every time.Duration) bool {
-	now := time.Now()
-	if last, ok := infoThrottle.Load(key); ok && now.Sub(last.(time.Time)) < every {
-		return false
-	}
-	infoThrottle.Store(key, now)
-	return true
-}
-
-// infof logs regardless of the debug level, mirroring upstream's utils.Infof.
-func infof(format string, args ...interface{}) {
-	_ = log.Output(2, fmt.Sprintf(format, args...))
-}
 
 // Mail.ru rejects the old Chrome/137 UA on the WebSocket upgrade with HTTP 409
 // on some edge nodes; a current Firefox UA is accepted for both the API and the
@@ -288,8 +265,8 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 		info, err := t.fetchDocInfo(t.weblink)
 		if err != nil {
 			utils.Debugf("[M-DOCS] fetchDocInfo failed: %v", err)
-			if throttled("m-docs.fetch", time.Minute) {
-				infof("[M-DOCS] cannot open the document: %v; retrying", err)
+			if utils.Throttled("m-docs.fetch", time.Minute) {
+				utils.Infof("[M-DOCS] cannot open the document: %v; retrying", err)
 			}
 			t.scheduleReconnect(attempt)
 			return
@@ -303,9 +280,7 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			// carrier never came up. Reported by @pirsasha (issue #163).
 			EnableCompression: true,
 			HandshakeTimeout:  15 * time.Second,
-			// Upstream wraps this dialer in netbind for interface pinning;
-			// this fork has no netbind, so the bare dialer stays as-is.
-			NetDialContext: (&net.Dialer{
+			NetDialContext: netbind.Wrap(&net.Dialer{
 				Timeout:   10 * time.Second,
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
@@ -404,8 +379,8 @@ func (t *MailruDocsTransport) connectToDoc(attempt int) {
 			_, message, err := conn.ReadMessage()
 			if err != nil {
 				utils.Debugf("[M-DOCS] Read error: %v", err)
-				if throttled("m-docs.drop", time.Minute) {
-					infof("[M-DOCS] connection to the document dropped: %v; reconnecting", err)
+				if utils.Throttled("m-docs.drop", time.Minute) {
+					utils.Infof("[M-DOCS] connection to the document dropped: %v; reconnecting", err)
 				}
 				t.SetConnected(false)
 				conn.Close()

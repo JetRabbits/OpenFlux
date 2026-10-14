@@ -46,6 +46,8 @@ func (s *Server) Listen() error {
 	if err != nil {
 		return err
 	}
+	// A core run as root still serves the app that started it.
+	utils.GiveToDirOwner(s.path)
 	s.mu.Lock()
 	s.listener = ln
 	s.mu.Unlock()

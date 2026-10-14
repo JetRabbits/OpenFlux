@@ -60,6 +60,8 @@ type fakeRoom struct {
 	rejected int
 	applied  int
 	noop     int // change_code calls whose patch did not match (silent no-op)
+
+	roomInfo int // shared_editor_room_info calls for this room
 }
 
 type fakeServer struct {
@@ -138,6 +140,51 @@ func (f *fakeServer) silentMutate(uuid string, fn func(string) string) int64 {
 	r.code = fn(r.code)
 	r.version++
 	return r.version
+}
+
+// mutateAndPush changes the stored document AND broadcasts a code_update push
+// with the new version: subscribers' baselines move forward WITHOUT any RPC
+// (the tracked-push case the cheap stale-baseline rebase rides on).
+func (f *fakeServer) mutateAndPush(uuid string, fn func(string) string) int64 {
+	r := f.roomObj(uuid)
+	if r == nil {
+		f.t.Fatalf("no room %s", uuid)
+	}
+	r.mu.Lock()
+	r.code = fn(r.code)
+	r.version++
+	ver := r.version
+	codeNow := r.code
+	subs := make([]*fakePeer, 0, len(r.subs))
+	for sp := range r.subs {
+		subs = append(subs, sp)
+	}
+	r.mu.Unlock()
+	ch := "$shared_editor:room-" + uuid
+	for _, sp := range subs {
+		sp.send(map[string]interface{}{"push": map[string]interface{}{
+			"channel": ch,
+			"pub": map[string]interface{}{
+				"data": map[string]interface{}{
+					"type": "code_update",
+					"payload": map[string]interface{}{
+						"uuid": uuid, "code": codeNow, "version": ver,
+					},
+				},
+			},
+		}})
+	}
+	return ver
+}
+
+func (f *fakeServer) roomInfoCount(uuid string) int {
+	r := f.roomObj(uuid)
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.roomInfo
 }
 
 func (f *fakeServer) codeOf(uuid string) string {
@@ -299,6 +346,7 @@ func (p *fakePeer) serveRPC(id int64, method string, data json.RawMessage) {
 		}
 		room.mu.Lock()
 		code, ver := room.code, room.version
+		room.roomInfo++
 		room.mu.Unlock()
 		p.send(map[string]interface{}{"id": id, "rpc": map[string]interface{}{"data": map[string]interface{}{
 			"uuid": d.Room, "language": nil, "code": code, "version": ver,

@@ -1,6 +1,7 @@
 package socks5
 
 import (
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -51,6 +52,8 @@ type flowLimits struct {
 type SOCKS5Server struct {
 	listenAddr string
 	dialer     Dialer
+	username   string
+	password   string
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -62,6 +65,9 @@ type SOCKS5Server struct {
 	activeUDP  atomic.Int32
 	refusedTCP atomic.Uint64
 	refusedUDP atomic.Uint64
+
+	bytesSent     atomic.Int64
+	bytesReceived atomic.Int64
 }
 
 var (
@@ -167,6 +173,38 @@ func (s *SOCKS5Server) ActiveTotalFlows() int   { return int(s.activeTCP.Load() 
 func (s *SOCKS5Server) RefusedTCPFlows() uint64 { return s.refusedTCP.Load() }
 func (s *SOCKS5Server) RefusedUDPFlows() uint64 { return s.refusedUDP.Load() }
 
+// SetAuth requires SOCKS5 username/password authentication (RFC 1929) for
+// every connection; call before Start/Bind. An empty username leaves
+// authentication disabled (the default), so any client is accepted exactly
+// as before.
+func (s *SOCKS5Server) SetAuth(username, password string) {
+	s.username = username
+	s.password = password
+}
+
+// BytesSent returns the total bytes relayed from clients to their dialed
+// targets (client -> internet) across every connection this server has
+// handled, for a live upload-speed indicator.
+func (s *SOCKS5Server) BytesSent() int64 { return s.bytesSent.Load() }
+
+// BytesReceived returns the total bytes relayed back from dialed targets to
+// clients (internet -> client), for a live download-speed indicator.
+func (s *SOCKS5Server) BytesReceived() int64 { return s.bytesReceived.Load() }
+
+// countingWriter tallies bytes as they're written, so io.Copy's running
+// total is visible immediately rather than only once the copy (i.e. the
+// whole connection) ends.
+type countingWriter struct {
+	dst     io.Writer
+	counter *atomic.Int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.dst.Write(p)
+	c.counter.Add(int64(n))
+	return n, err
+}
+
 // Bind reserves the listen address so callers can detect "address already in
 // use" synchronously, before serving. Safe to call once; Start binds lazily if
 // it wasn't called.
@@ -243,6 +281,18 @@ func (s *SOCKS5Server) Close() error {
 	return nil
 }
 
+// SOCKS5 reply codes (RFC 1928 section 6), used for both the CONNECT dial
+// outcome and the pre-dial rejections below so a client always gets an
+// explicit, standard answer instead of a bare connection close - which most
+// SOCKS5 clients read as "still trying" rather than "this failed", and hang
+// on rather than fail over or report an error.
+const (
+	replySucceeded           = 0x00
+	replyHostUnreachable     = 0x04
+	replyCommandNotSupported = 0x07
+	replyAddressNotSupported = 0x08
+)
+
 func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 	s.mu.Lock()
 	handshake := s.limits.handshake
@@ -270,37 +320,51 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 		}
 	}()
 	defer clientConn.Close()
+	remote := clientConn.RemoteAddr()
+	utils.Debugf("[SOCKS5] Accepted connection from %s", remote)
 
 	var greeting [2]byte
 	if _, err := io.ReadFull(clientConn, greeting[:]); err != nil || greeting[0] != 0x05 {
+		utils.Debugf("[SOCKS5] %s: bad greeting: %v", remote, err)
 		return
 	}
 	methods := make([]byte, int(greeting[1]))
 	if _, err := io.ReadFull(clientConn, methods); err != nil {
+		utils.Debugf("[SOCKS5] %s: truncated method list: %v", remote, err)
 		return
 	}
-	noAuth := false
-	for _, method := range methods {
-		if method == 0x00 {
-			noAuth = true
-			break
+
+	if s.username != "" {
+		if !containsMethod(methods, 0x02) {
+			utils.Debugf("[SOCKS5] %s: client didn't offer username/password auth, rejecting", remote)
+			_, _ = clientConn.Write([]byte{0x05, 0xFF})
+			return
 		}
-	}
-	if !noAuth {
-		_, _ = clientConn.Write([]byte{0x05, 0xff})
+		if _, err := clientConn.Write([]byte{0x05, 0x02}); err != nil {
+			return
+		}
+		if !s.authenticate(clientConn) {
+			utils.Debugf("[SOCKS5] %s: authentication failed", remote)
+			return
+		}
+		utils.Debugf("[SOCKS5] %s: authenticated", remote)
+	} else if !containsMethod(methods, 0x00) {
+		utils.Debugf("[SOCKS5] %s: client offered no acceptable auth method", remote)
+		_, _ = clientConn.Write([]byte{0x05, 0xFF})
 		return
-	}
-	if _, err := clientConn.Write([]byte{0x05, 0x00}); err != nil {
+	} else if _, err := clientConn.Write([]byte{0x05, 0x00}); err != nil {
 		return
 	}
 
 	var request [4]byte
 	if _, err := io.ReadFull(clientConn, request[:]); err != nil || request[0] != 0x05 || request[2] != 0 {
+		utils.Debugf("[SOCKS5] %s: bad request: %v", remote, err)
 		return
 	}
 	targetAddr, err := readAddress(clientConn, request[3])
 	if err != nil {
-		writeReply(clientConn, 0x08, nil)
+		utils.Debugf("[SOCKS5] %s: bad target address: %v", remote, err)
+		writeReply(clientConn, replyAddressNotSupported, nil)
 		return
 	}
 
@@ -315,7 +379,7 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 			return
 		}
 		defer s.releaseFlow(false)
-		s.handleConnect(clientConn, targetAddr)
+		s.handleConnect(clientConn, remote, targetAddr)
 	case 0x03:
 		if !s.reserveFlow(true) {
 			s.refusedUDP.Add(1)
@@ -327,23 +391,23 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 		defer s.releaseFlow(true)
 		s.handleUDPAssociate(clientConn, targetAddr)
 	default:
-		writeReply(clientConn, 0x07, nil)
+		utils.Debugf("[SOCKS5] %s: unsupported command 0x%02x", remote, request[1])
+		writeReply(clientConn, replyCommandNotSupported, nil)
 	}
 }
 
-func (s *SOCKS5Server) handleConnect(clientConn net.Conn, targetAddr string) {
-
-	utils.Debugf("[SOCKS5] CONNECT %s", targetAddr)
+func (s *SOCKS5Server) handleConnect(clientConn net.Conn, remote net.Addr, targetAddr string) {
+	utils.Debugf("[SOCKS5] %s: CONNECT %s", remote, targetAddr)
 
 	targetConn, err := s.dialWithTimeout(targetAddr)
 	if err != nil {
-		utils.Debugf("[SOCKS5] Dial failed: %v", err)
-		writeReply(clientConn, 0x04, nil)
+		utils.Debugf("[SOCKS5] %s: dial %s failed: %v", remote, targetAddr, err)
+		writeReply(clientConn, replyHostUnreachable, nil)
 		return
 	}
 	defer targetConn.Close()
 
-	if err := writeReply(clientConn, 0x00, targetConn.LocalAddr()); err != nil {
+	if err := writeReply(clientConn, replySucceeded, targetConn.LocalAddr()); err != nil {
 		return
 	}
 
@@ -384,8 +448,11 @@ func (s *SOCKS5Server) handleConnect(clientConn net.Conn, targetAddr string) {
 	go func() {
 		defer wg.Done()
 		defer finish()
+		// The fork's idle-aware relay; upstream's byte counters ride the
+		// per-write callback so BytesSent/BytesReceived stay live.
 		relayWithSessionIdle(targetConn, clientConn, idle, func(n int) {
 			lastActivity.Store(time.Now().UnixNano())
+			s.bytesSent.Add(int64(n))
 		}, stalled)
 	}()
 
@@ -394,6 +461,7 @@ func (s *SOCKS5Server) handleConnect(clientConn net.Conn, targetAddr string) {
 		defer finish()
 		relayWithSessionIdle(clientConn, targetConn, idle, func(n int) {
 			lastActivity.Store(time.Now().UnixNano())
+			s.bytesReceived.Add(int64(n))
 		}, stalled)
 	}()
 
@@ -566,6 +634,49 @@ func relayWithSessionIdle(dst, src net.Conn, timeout time.Duration, bump func(in
 			return
 		}
 	}
+}
+
+func containsMethod(methods []byte, target byte) bool {
+	for _, m := range methods {
+		if m == target {
+			return true
+		}
+	}
+	return false
+}
+
+// authenticate performs RFC 1929 username/password subnegotiation. It writes
+// the required reply either way, and returns whether the credentials
+// matched (constant-time, to avoid leaking a timing signal on the
+// comparison).
+func (s *SOCKS5Server) authenticate(clientConn net.Conn) bool {
+	// ver(1) ulen(1) uname(ulen) plen(1) passwd(plen); read field by field,
+	// since one Read may return only part of the request.
+	var head [2]byte
+	if _, err := io.ReadFull(clientConn, head[:]); err != nil || head[0] != 0x01 {
+		return false
+	}
+	username := make([]byte, int(head[1]))
+	if _, err := io.ReadFull(clientConn, username); err != nil {
+		return false
+	}
+	var plen [1]byte
+	if _, err := io.ReadFull(clientConn, plen[:]); err != nil {
+		return false
+	}
+	password := make([]byte, int(plen[0]))
+	if _, err := io.ReadFull(clientConn, password); err != nil {
+		return false
+	}
+
+	usernameOK := subtle.ConstantTimeCompare(username, []byte(s.username)) == 1
+	passwordOK := subtle.ConstantTimeCompare(password, []byte(s.password)) == 1
+	if usernameOK && passwordOK {
+		clientConn.Write([]byte{0x01, 0x00})
+		return true
+	}
+	clientConn.Write([]byte{0x01, 0x01})
+	return false
 }
 
 func (s *SOCKS5Server) handleUDPAssociate(control net.Conn, requestedAddr string) {

@@ -34,7 +34,17 @@ const MaxFrameBytes = 1 << 20
 type CookiesRequestPayload struct {
 	Transport string `json:"transport"`
 	URL       string `json:"url"`
-	Reason    string `json:"reason"`
+	// HTML is a script transport's own setup/login page (see
+	// transport/script/js/template_html.html), sent instead of URL when
+	// the transport raised one; "" for every native transport.
+	HTML   string `json:"html,omitempty"`
+	Reason string `json:"reason"`
+	// Own marks a page that is the script's own - HTML, or a URL on the
+	// script's own loopback server (http://127.0.0.1:port) - rather than a
+	// real site: the app shows it as it is, gives it window.openfluxSubmit
+	// and does not collect cookies from it. The core decides this
+	// (script.IsOwnPage); an app must not guess from the URL.
+	Own bool `json:"own,omitempty"`
 	// Remote marks a check the exit node needs: it must be passed from the
 	// exit's address, and the answering offer must set Remote too.
 	Remote bool `json:"remote,omitempty"`
@@ -58,6 +68,12 @@ type StatusPayload struct {
 	BytesIn   uint64 `json:"bytes_in"`
 	BytesOut  uint64 `json:"bytes_out"`
 	UptimeMs  int64  `json:"uptime_ms"`
+	// Active names the carrier data currently goes through ("" when none
+	// reaches the peer). Sessions only.
+	Active string `json:"active,omitempty"`
+	// ActiveAll names every carrier data is spread over: several when they
+	// share the highest priority. Active is the first. Sessions only.
+	ActiveAll []string `json:"active_all,omitempty"`
 }
 
 type CommandPayload struct {

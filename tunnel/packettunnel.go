@@ -20,6 +20,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
 
+	"github.com/JetRabbits/OpenFlux/network"
 	"github.com/JetRabbits/OpenFlux/utils"
 )
 
@@ -51,10 +52,10 @@ type UDPDialer interface {
 func NewPacketTunnel(dialer TCPDialer, mtu uint32) *PacketTunnel {
 	s := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcpProtocol(), udp.NewProtocol},
 	})
 
-	SetTCPBuffers(s)
+	TuneTCP(s)
 
 	ep := channel.New(256, mtu, "")
 	nicID := tcpip.NICID(1)
@@ -213,6 +214,7 @@ func (pt *PacketTunnel) dnsOverTCP(dest string, query []byte) ([]byte, error) {
 
 // WriteInbound injects one IPv4 packet coming from the device into the stack.
 func (pt *PacketTunnel) WriteInbound(ipPacket []byte) {
+	network.LogPacket("PKT", network.DirOutbound, ipPacket)
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: buffer.MakeWithData(append([]byte{}, ipPacket...)),
 	})
@@ -231,6 +233,7 @@ func (pt *PacketTunnel) ReadOutbound(ctx context.Context) []byte {
 	data := append([]byte(nil), view.ToSlice()...)
 	view.Release()
 	p.DecRef()
+	network.LogPacket("PKT", network.DirInbound, data)
 	return data
 }
 

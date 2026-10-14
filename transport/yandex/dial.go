@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"sort"
 	"time"
+
+	"github.com/JetRabbits/OpenFlux/netbind"
 )
 
 // The tunnel itself is IPv4: the L3 exit's raw sockets, the client's gVisor
@@ -22,9 +24,6 @@ import (
 // Every connection of the Yandex carriers (document fetch, captcha PoW,
 // WebSocket, Volga relay) dials through dialIPv4First: IPv4 addresses first,
 // IPv6 only when none of them answers.
-//
-// This fork has no netbind (interface pinning), so the plain net.Dialer is
-// used where upstream delegates to it.
 
 // carrierDialTimeout bounds one connection attempt, so a dead IPv4 route
 // falls through to IPv6 in time instead of eating the whole connect budget.
@@ -33,16 +32,15 @@ const carrierDialTimeout = 10 * time.Second
 // lookupIPAddr is the resolver; replaced in tests.
 var lookupIPAddr = net.DefaultResolver.LookupIPAddr
 
-// dialIPv4First is a DialContext that tries a host's IPv4 addresses before
-// its IPv6 ones.
+// dialIPv4First is a DialContext that tries a host's IPv4 addresses before its
+// IPv6 ones. It follows the interface binding of package netbind.
 func dialIPv4First(ctx context.Context, network, address string) (net.Conn, error) {
-	d := &net.Dialer{Timeout: carrierDialTimeout, KeepAlive: 30 * time.Second}
 	if network != "tcp" {
-		return d.DialContext(ctx, network, address)
+		return netbind.DialContext(ctx, network, address)
 	}
 	host, port, err := net.SplitHostPort(address)
 	if err != nil || net.ParseIP(host) != nil {
-		return d.DialContext(ctx, network, address)
+		return netbind.DialContext(ctx, network, address)
 	}
 	addrs, err := lookupIPAddr(ctx, host)
 	if err != nil {
@@ -61,7 +59,7 @@ func dialIPv4First(ctx context.Context, network, address string) (net.Conn, erro
 		if a.IP.To4() != nil {
 			netw = "tcp4"
 		}
-		conn, err := d.DialContext(ctx, netw, net.JoinHostPort(a.IP.String(), port))
+		conn, err := netbind.Dialer(carrierDialTimeout).DialContext(ctx, netw, net.JoinHostPort(a.IP.String(), port))
 		if err == nil {
 			return conn, nil
 		}

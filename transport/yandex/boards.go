@@ -115,7 +115,7 @@ type BoardsTransport struct {
 	cookieJar *cookiejar.Jar
 	jarMu     sync.RWMutex
 
-	errNotifier func(err error, transportName, url, reason string)
+	errNotifier func(err error, transportName, url, html, reason string)
 }
 
 func NewBoardsTransport(rawURL string, config transport.TransportConfig) *BoardsTransport {
@@ -133,7 +133,7 @@ func NewBoardsTransport(rawURL string, config transport.TransportConfig) *Boards
 // fetchDocInfo (its captcha path is the old showcaptchafast, which the
 // internal PoW solver handles), but the hook is wired for parity with the
 // other transports.
-func (t *BoardsTransport) SetErrorNotifier(fn func(err error, transportName, url, reason string)) {
+func (t *BoardsTransport) SetErrorNotifier(fn func(err error, transportName, url, html, reason string)) {
 	t.errNotifier = fn
 }
 
@@ -449,8 +449,8 @@ func (t *BoardsTransport) connectLoop(info boardsInfo) {
 		lasted := time.Since(began)
 		if err != nil {
 			utils.Debugf("[BOARDS] ws error after %v: %v", lasted.Round(time.Second), err)
-			if throttled("boards.drop", time.Minute) {
-				infof("[BOARDS] connection to the board dropped after %v: %v; reconnecting", lasted.Round(time.Second), err)
+			if utils.Throttled("boards.drop", time.Minute) {
+				utils.Infof("[BOARDS] connection to the board dropped after %v: %v; reconnecting", lasted.Round(time.Second), err)
 			}
 		}
 		t.SetConnected(false)

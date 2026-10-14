@@ -10,6 +10,8 @@ package manager
 import (
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +36,7 @@ type CookieProvider interface {
 type Entry struct {
 	Name     string
 	Type     string
+	URL      string // document URL, "" when the carrier has none
 	Priority int
 	Raw      transport.Transport
 	Provider CookieProvider // nil if the transport does not carry cookies
@@ -113,11 +116,21 @@ func (m *Manager) Add(name, typ string, raw transport.Transport, priority int, p
 	// channel.
 	if en, ok := raw.(transport.ErrorNotifier); ok {
 		transportName := name
-		en.SetErrorNotifier(func(_ error, _, url, reason string) {
-			m.NotifyCaptcha(transportName, url, reason)
+		en.SetErrorNotifier(func(_ error, _, url, html, reason string) {
+			m.NotifyCaptcha(transportName, url, html, reason)
 		})
 	}
 	return nil
+}
+
+// SetURL records the document URL of an attached transport, which cookie
+// messages carry so the peer can match carriers it names differently.
+func (m *Manager) SetURL(name, url string) {
+	m.mu.Lock()
+	if e, ok := m.entries[name]; ok {
+		e.URL = url
+	}
+	m.mu.Unlock()
 }
 
 // Remove detaches a transport from the Session and stops it.
@@ -248,34 +261,114 @@ func (m *Manager) UseCookieStore(store *transport.CookieStore, name, key string)
 	return nil
 }
 
-// AcceptCookies applies a jar to one transport and persists it, whether it
-// came from the peer over the control channel or from the local app (IPC).
+// AcceptCookies adds a jar to one transport's cookies and persists the
+// result, whether it came from the peer over the control channel or from
+// the local app (IPC). Incoming cookies win over kept ones of the same name,
+// but the rest stay: a check a client passed must not wipe an account
+// login the exit was given.
 func (m *Manager) AcceptCookies(name string, jar map[string]string) error {
-	if err := m.ApplyCookiesFor(name, jar); err != nil {
-		return err
-	}
 	m.mu.RLock()
 	store, key := m.store, m.cookieKeys[name]
 	m.mu.RUnlock()
+	var kept map[string]string
 	if store != nil && key != "" {
-		return store.Save(key, jar)
+		kept = store.Load(key)
+	}
+	if kept == nil {
+		kept, _ = m.FetchCookiesFor(name)
+	}
+	merged := make(map[string]string, len(kept)+len(jar))
+	for k, v := range kept {
+		merged[k] = v
+	}
+	for k, v := range jar {
+		merged[k] = v
+	}
+	if err := m.ApplyCookiesFor(name, merged); err != nil {
+		return err
+	}
+	if store != nil && key != "" {
+		return store.Save(key, merged)
 	}
 	return nil
 }
 
-// cookieTransport resolves the transport a cookie message refers to: the
-// named one, or for peers that predate named messages, the
-// highest-priority transport that carries cookies.
-func (m *Manager) cookieTransport(name string) string {
+// accountCookies are the Yandex cookies that carry a signed-in account.
+var accountCookies = map[string]bool{
+	"Session_id": true, "sessionid2": true, "sessar": true, "sessguard": true,
+	"L": true, "yandex_login": true, "lah": true, "mda2_beacon": true,
+}
+
+// shareableCookies is jar without account login cookies: what an exit may
+// hand to a client that asks. Clients need a passed check, never the
+// login of whoever set up the exit.
+func shareableCookies(jar map[string]string) map[string]string {
+	out := make(map[string]string, len(jar))
+	for k, v := range jar {
+		if !accountCookies[k] {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// cookieTransport resolves the transport a cookie message refers to. The
+// two sides do not always name carriers alike (the apps name them after the
+// type, "mailru", "mailru-2"; a .conf or a panel names sections freely), so
+// after the name itself it tries the document URL the message carries,
+// then the type the name starts with when this side has one carrier of it.
+// Peers that predate named messages mean the highest-priority transport
+// that carries cookies.
+func (m *Manager) cookieTransport(name, doc string) string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if name != "" {
+	if name == "" {
+		for _, n := range m.order {
+			if m.entries[n].Provider != nil {
+				return n
+			}
+		}
+		return ""
+	}
+	if _, ok := m.entries[name]; ok {
 		return name
 	}
-	for _, n := range m.order {
-		if m.entries[n].Provider != nil {
-			return n
+	if doc != "" {
+		for _, n := range m.order {
+			if m.entries[n].URL == doc {
+				utils.Debugf("[MANAGER] peer's carrier %q is this side's %q (same document)", name, n)
+				return n
+			}
 		}
+	}
+	typ := name
+	if i := strings.LastIndex(name, "-"); i > 0 {
+		if _, err := strconv.Atoi(name[i+1:]); err == nil {
+			typ = name[:i]
+		}
+	}
+	var match []string
+	for _, n := range m.order {
+		if m.entries[n].Type == typ {
+			match = append(match, n)
+		}
+	}
+	if len(match) == 1 {
+		utils.Debugf("[MANAGER] peer's carrier %q is this side's %q (only %s)", name, match[0], typ)
+		return match[0]
+	}
+	if utils.Throttled("manager.name."+name, time.Minute) {
+		utils.Infof("[MANAGER] the peer refers to carrier %q, which this side cannot match (carriers: %v): the two configs name carriers differently", name, m.order)
+	}
+	return ""
+}
+
+// entryURL is the document URL of an attached transport.
+func (m *Manager) entryURL(name string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if e, ok := m.entries[name]; ok {
+		return e.URL
 	}
 	return ""
 }
@@ -288,7 +381,7 @@ func (m *Manager) handleCookies(sub control.Subtype, payload []byte) {
 		utils.Debugf("[MANAGER] bad cookies payload: %v", err)
 		return
 	}
-	name := m.cookieTransport(cp.Transport)
+	name := m.cookieTransport(cp.Transport, cp.Doc)
 	if name == "" {
 		return
 	}
@@ -302,7 +395,8 @@ func (m *Manager) handleCookies(sub control.Subtype, payload []byte) {
 			utils.Debugf("[MANAGER] fetch cookies (%s): %v", name, err)
 			return
 		}
-		body, _ := (&control.CookiesPayload{Transport: name, Jar: jar, Reason: "requested"}).Encode()
+		jar = shareableCookies(jar)
+		body, _ := (&control.CookiesPayload{Transport: name, Doc: m.entryURL(name), Jar: jar, Reason: "requested"}).Encode()
 		_ = m.SendControl(control.SubtypeCookiesResponse, body)
 	case control.SubtypeCookiesResponse, control.SubtypeCookiesOffer:
 		if len(cp.Jar) == 0 {
@@ -356,11 +450,18 @@ func (m *Manager) DispatchControl(sub control.Subtype, payload []byte) {
 			utils.Debugf("[MANAGER] bad AuthRequired payload: %v", err)
 			return
 		}
+		// The exit's side of that transport is stuck: stop routing through
+		// it here as well, the cookies that unstick it included. The report
+		// keeps the exit's name: the cookies go back under it.
+		if local := m.cookieTransport(req.Transport, req.Doc); local != "" {
+			m.session.MarkStalled(local)
+		}
+		utils.Infof("[MANAGER] the exit's carrier %q needs a check in a browser (%s): %s", req.Transport, req.Reason, req.URL)
 		m.mu.RLock()
 		cb := m.remoteAuth
 		m.mu.RUnlock()
 		if cb != nil {
-			cb(req.Transport, req.URL, req.Reason)
+			cb(req.Transport, req.URL, req.HTML, req.Reason)
 		}
 
 	default:
@@ -468,9 +569,11 @@ func (m *Manager) Stats() transport.TransportStats {
 // ---- captcha notifications ----
 
 // CaptchaNotifier is called when a transport reports that it needs fresh
-// cookies (ErrCaptchaRequired or ErrLoginRequired). Wired to the IPC server
-// by main.go.
-type CaptchaNotifier func(transportName, url, reason string)
+// cookies (ErrCaptchaRequired or ErrLoginRequired) or, for a script
+// transport, any page it wants the operator to go through (login, one-time
+// setup) - html is set instead of url when the page is the script's own
+// rather than a real site. Wired to the IPC server by main.go.
+type CaptchaNotifier func(transportName, url, html, reason string)
 
 // SetCaptchaNotifier installs the callback.
 func (m *Manager) SetCaptchaNotifier(n CaptchaNotifier) {
@@ -484,19 +587,22 @@ func (m *Manager) SetCaptchaNotifier(n CaptchaNotifier) {
 // every report. On the exit node there is usually no app, and the check
 // has to be passed from the exit's address anyway, so the report also goes
 // to the client over whichever carrier still reaches it.
-func (m *Manager) NotifyCaptcha(name, url, reason string) {
+func (m *Manager) NotifyCaptcha(name, url, html, reason string) {
+	// A transport waiting on a check carries nothing; route around it,
+	// and in particular do not send its own AuthRequired through it.
+	m.session.MarkStalled(name)
 	m.mu.RLock()
 	n := m.captchaNotifier
 	m.mu.RUnlock()
 	if n != nil {
-		n(name, url, reason)
+		n(name, url, html, reason)
 	}
 	if m.session.IsExit() {
-		m.forwardAuth(name, url, reason)
+		m.forwardAuth(name, url, html, reason)
 	}
 }
 
-func (m *Manager) forwardAuth(name, url, reason string) {
+func (m *Manager) forwardAuth(name, url, html, reason string) {
 	now := time.Now()
 	m.mu.Lock()
 	if m.authSent == nil {
@@ -509,7 +615,7 @@ func (m *Manager) forwardAuth(name, url, reason string) {
 	m.authSent[name] = now
 	m.mu.Unlock()
 
-	body, _ := (&control.AuthRequiredPayload{Transport: name, URL: url, Reason: reason}).Encode()
+	body, _ := (&control.AuthRequiredPayload{Transport: name, URL: url, HTML: html, Reason: reason, Doc: m.entryURL(name)}).Encode()
 	if err := m.SendControl(control.SubtypeAuthRequired, body); err != nil {
 		// No client yet: let the transport's next report try again.
 		utils.Debugf("[MANAGER] forward AuthRequired (%s): %v", name, err)
