@@ -85,11 +85,16 @@ func New(typ, url string, params map[string]interface{}, o Options) (transport.T
 	case "mailru":
 		return mailru.NewMailruDocsTransport(url, base), nil
 	case "cupsonline":
-		inner := cupsonline.NewCupsonlineTransport(url, base, !o.IsExit)
-		return &stripedRoomTransport{
-			StripedTransport: transport.NewStripedTransport([]transport.Transport{inner}),
-			inner:            inner,
-		}, nil
+		// Deliberately UNstriped (reverting the upstream edcf77a wrap):
+		// the code channel already fans batches across its own rooms with
+		// independent RTTs, and one striped lane on top orders across ALL of
+		// them — production exit measured late≈delivered (half of every
+		// batch arriving out of order), the lane's loss estimate pinned at
+		// 100% "DEAD", and the ARQ retransmit storm ate every byte the
+		// batching won (43 KB/s before vs 49 KB/s after the wrap). The
+		// multi-room parallelism IS the lane design here; striped's value
+		// (SFU datagram lanes with real loss) does not apply.
+		return cupsonline.NewCupsonlineTransport(url, base, !o.IsExit), nil
 	case "avito":
 		inner := avito.NewAvitoTransport(url, base, o.AvitoCookies, !o.IsExit)
 		return &stripedRoomTransport{
