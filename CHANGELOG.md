@@ -5,6 +5,25 @@ All notable changes to the OpenFlux core. Format loosely follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A 100-byte request through a `cupsonline` exit answered with a 2.3-3.8 s TTFB idle
+  (6.5-10.5 s under load)** — the Ookla Speedtest app's ~2 s probe budget simply died. The
+  writer was stop-and-wait: every `change_code` call waited its full round trip (uplink
+  dwell + RPC + downlink push, 0.5-1 s each) before the next batch could start, so a TCP
+  handshake plus TLS spent 4-6 of those RTTs in series, and under load replies queued
+  behind bulk bytes. The writer now **pipelines**: three change_code calls may be
+  outstanding per channel at once (the window is full and upstream backpressure resumes
+  only when it is), the next batch builds optimistically on the document the writes in
+  flight predict, replies are applied by version monotonicity (out-of-order replies can
+  not roll the baseline back), and a write the server silently no-ops gets one
+  rebase+retransmit while the rest of the window rides on. The batch dwell drops 70 ms →
+  30 ms; the 12 KB batch cap and the 12 ms idle flush stay. The wire format — diff
+  dialect, framing, chunking — is byte-for-byte untouched: old clients interop, they
+  just pipeline less. Bulk throughput is unchanged (the same 12 KB batches, 16 calls for
+  a 160-frame test stream); the first frame's RTT no longer waits for the previous
+  call's reply.
+
 ## [0.5.1] - 2026-10-11
 
 ### Fixed
