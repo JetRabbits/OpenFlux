@@ -599,6 +599,13 @@ DEPRECATED (removed in v2)
 			log.Printf("warning: -exit-node is deprecated, use --role=exit")
 			*role = roleExit
 		}
+		// The early isExit (above) was computed from the pre-shim *role, so
+		// every legacy `-exit-node` deployment (the helm chart's entrypoint,
+		// node wizards) silently built exit-only transports in CLIENT mode:
+		// cupsonline demanded a base64 room list and died with "striped: no
+		// lane started". Recompute after the deprecated flags resolve, same
+		// as the .conf path does.
+		isExit = *role == roleExit || *role == roleBenchSink
 	}
 	if *depTun {
 		log.Printf("warning: -tun is deprecated, use --inbound=tun")
