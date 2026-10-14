@@ -14,14 +14,40 @@ import (
 	"github.com/JetRabbits/OpenFlux/utils"
 )
 
+// lockedBuffer is a bytes.Buffer safe for concurrent Write: run()'s exit
+// pump goroutine can still be dispatching the CLOSE frame (an early
+// remoteClosed Debugf) while the test reads the capture.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
 // captureLog runs fn at the given debug level and returns what was logged.
+// The level goes back to 0 BEFORE the buffer is read and after a settle
+// window: a run() whose mux Close raced the exit reader keeps logging for
+// a few milliseconds after fn returns, and those stragglers must neither
+// race the read (-race flake) nor pollute the NEXT capture's assertions.
 func captureLog(t *testing.T, level int, fn func()) string {
 	t.Helper()
-	var buf bytes.Buffer
+	var buf lockedBuffer
 	utils.SetOutput(&buf)
 	utils.SetLevel(level)
 	t.Cleanup(func() { utils.SetLevel(0) })
 	fn()
+	utils.SetLevel(0)
+	time.Sleep(150 * time.Millisecond)
 	return buf.String()
 }
 
