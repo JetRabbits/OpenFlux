@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/JetRabbits/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/transport/avito"
 	"github.com/JetRabbits/OpenFlux/transport/cupsonline"
 	"github.com/JetRabbits/OpenFlux/transport/mailru"
 	"github.com/JetRabbits/OpenFlux/transport/oneme"
@@ -30,6 +31,7 @@ func TestEveryNativeTypeBuilds(t *testing.T) {
 		"boards":     &yandex.BoardsTransport{},
 		"mailru":     &mailru.MailruDocsTransport{},
 		"cupsonline": &cupsonline.CupsonlineTransport{},
+		"avito":      &avito.AvitoTransport{},
 		"oneme":      &oneme.OneMeTransport{},
 		"direct":     &transport.DirectTransport{},
 	}
