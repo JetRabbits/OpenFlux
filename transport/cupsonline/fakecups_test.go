@@ -16,7 +16,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/transport"
 )
 
 // fakeCups stands in for cups.online: room pages, subscription tokens and a

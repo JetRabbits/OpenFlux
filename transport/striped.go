@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/p1neappleXpress/OpenFlux/utils"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // StripedTransport spreads frames over several child transports (lanes), puts

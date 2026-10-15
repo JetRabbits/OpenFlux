@@ -22,9 +22,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/p1neappleXpress/OpenFlux/netbind"
-	"github.com/p1neappleXpress/OpenFlux/transport"
-	"github.com/p1neappleXpress/OpenFlux/utils"
+	"github.com/JetRabbits/OpenFlux/netbind"
+	"github.com/JetRabbits/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // baseRoomURL is where the rooms live. It's a variable only so tests can aim

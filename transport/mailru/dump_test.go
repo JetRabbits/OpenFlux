@@ -13,7 +13,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/transport"
 )
 
 // TestLiveMailruDump connects to a real public Mail.ru document, completes the

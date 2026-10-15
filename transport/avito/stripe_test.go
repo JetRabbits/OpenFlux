@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/transport"
 )
 
 func fastConfig() AvitoConfig {

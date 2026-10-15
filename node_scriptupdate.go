@@ -5,10 +5,10 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/p1neappleXpress/OpenFlux/transport"
-	"github.com/p1neappleXpress/OpenFlux/transport/manager"
-	"github.com/p1neappleXpress/OpenFlux/transport/script"
-	"github.com/p1neappleXpress/OpenFlux/utils"
+	"github.com/JetRabbits/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/transport/manager"
+	"github.com/JetRabbits/OpenFlux/transport/script"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // startNodeScriptUpdater wires the Go-side auto-updater into a running node: it

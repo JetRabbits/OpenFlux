@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/transport"
 )
 
 // startStripedPair is startPair on the striped wire: the exit creates the

@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/p1neappleXpress/OpenFlux/utils"
+	"github.com/JetRabbits/OpenFlux/utils"
 )
 
 // AutoUpdater keeps a node's installed .flux transports current and drives the

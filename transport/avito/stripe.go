@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"time"
 
-	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/transport"
 )
 
 // A striped Avito transport runs a transport.StripedTransport over its room

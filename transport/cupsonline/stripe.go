@@ -3,7 +3,7 @@ package cupsonline
 import (
 	"time"
 
-	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/transport"
 )
 
 // A striped cups transport runs a transport.StripedTransport over its rooms,

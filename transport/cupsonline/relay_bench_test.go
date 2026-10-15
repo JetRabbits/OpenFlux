@@ -17,8 +17,8 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/p1neappleXpress/OpenFlux/netbind"
-	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/JetRabbits/OpenFlux/netbind"
+	"github.com/JetRabbits/OpenFlux/transport"
 )
 
 // TestLiveRelayBench measures what cups.online really relays: sender

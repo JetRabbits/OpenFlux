@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/p1neappleXpress/OpenFlux/share"
+	"github.com/JetRabbits/OpenFlux/share"
 )
 
 // A cups.online or Avito exit on the phone starts without a room list (it
