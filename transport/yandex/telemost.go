@@ -208,6 +208,15 @@ type TelemostTransport struct {
 	// with the lane's tag hidden after it (telemost_stripe.go); empty
 	// outside a group.
 	laneName string
+
+	// Downlink path-rotation state (see rotateMediaPath). The counters must
+	// outlive a subscriber track reader because rotating the path closes the
+	// peer connections that reader is running on: a fresh reader is created
+	// for the fresh session and has to inherit the rotation history, not
+	// start over as if nothing had happened.
+	pathRotations atomic.Uint32
+	lastRotAt     atomic.Int64  // unix seconds of the last rotation
+	rotating      atomic.Bool   // a media-path rotation owns the next dial
 }
 
 type TelemostConnectionResponse struct {
@@ -309,6 +318,131 @@ func (t *TelemostTransport) Stop() error {
 	}
 	t.SetConnected(false)
 	return t.BaseTransport.Stop()
+}
+
+// rotateMediaPath tears down the WebRTC session (peer connections first, then
+// the signalling socket) so the existing reconnect path re-establishes it with
+// brand-new ICE candidate tuples.
+//
+// It exists for one measured failure mode: the SFU→subscriber UDP path loses
+// 40-90% of packets for some flows while the reverse direction of the exact
+// same lane stays at 0% loss. The loss tracks the 5-tuple chosen at session
+// setup - ISP-level per-flow policing on the subscriber's downlink - so a
+// session that drew an unlucky tuple keeps a crippled downlink for its entire
+// life, no matter how many times the sender retransmits. Observed on iOS over
+// two reconnects of the same tunnel: 17KB/s for the whole life of the session
+// with lane loss 88%/40%/0%, then ~1.6MB/s immediately after a manual
+// reconnect that changed nothing but the ICE ports.
+// Closing and reopening the session draws a new tuple, which empirically
+// restores full speed. The striped layer above is unaffected: the reconnect
+// lands as an ordinary "peer restarted, starting over" resync, the machinery
+// that already runs on every app restart.
+//
+// Gated by TELEMOST_PATH_ROTATION: "client" (default - only non-exit sides,
+// because the observed loss was on subscriber downlinks and exit lanes flap
+// every waiting client's transport when they rotate), "all", or "0" to
+// disable. TELEMOST_ROTATE_GAP_PCT is the loss threshold (default 25%,
+// healthy sessions measure 0.2-0.7%); 0 disables. The caller in
+// readSharingVideoTrack only asks after several consecutive windows of a
+// flowing stream (>=TELEMOST_ROTATE_MINPKTS packets per window, default 100),
+// so an idle lane is never blamed for silence.
+func (t *TelemostTransport) rotateMediaPath(gapPct float64, windows int) bool {
+	mode := envOrDefault("TELEMOST_PATH_ROTATION", "client")
+	if mode == "0" || (mode == "client" && t.isExitNode) {
+		return false
+	}
+	threshold, _ := strconv.Atoi(envOrDefault("TELEMOST_ROTATE_GAP_PCT", "25"))
+	if threshold <= 0 || gapPct < float64(threshold) {
+		return false
+	}
+	maxRot, _ := strconv.Atoi(envOrDefault("TELEMOST_ROTATE_MAX", "6"))
+	cooldownSec, _ := strconv.Atoi(envOrDefault("TELEMOST_ROTATE_COOLDOWN_SEC", "20"))
+	if !t.IsRunning() {
+		return false
+	}
+	now := time.Now().Unix()
+	if d := now - t.lastRotAt.Load(); cooldownSec > 0 && d < int64(cooldownSec) {
+		utils.Debugf("[Telemost] downlink loss %.0f%% but last rotation was %ds ago (cooldown), waiting it out [%s]",
+			gapPct, d, roleStr(t.isExitNode))
+		return false
+	}
+	rotations := t.pathRotations.Load()
+	if maxRot > 0 && rotations >= uint32(maxRot) {
+		utils.Infof("[Telemost] downlink loss %.0f%% but %d rotations already attempted - giving up on the lottery, keeping the current path [%s]",
+			gapPct, rotations, roleStr(t.isExitNode))
+		return false
+	}
+	t.lastRotAt.Store(now)
+	t.pathRotations.Store(rotations + 1)
+	utils.Infof("[Telemost] downlink loss %.0f%% over %d windows - rotating media path, rotation %d (new ICE tuple) [%s]",
+		gapPct, windows, rotations+1, roleStr(t.isExitNode))
+
+	// Peer connections first: signalling reconnect brings new ones up via
+	// serverHello, and handleSubscriberOffer only initialises the subscriber
+	// PC when the field is nil, so the stale closed ones must be unlinked or
+	// the fresh session would SetRemoteDescription onto a dead peer.
+	if t.publisherPC != nil {
+		_ = t.publisherPC.Close()
+		t.publisherPC = nil
+	}
+	if t.subscriberPC != nil {
+		_ = t.subscriberPC.Close()
+		t.subscriberPC = nil
+	}
+	// A plain WS reconnect on the old session identity is not an option:
+	// measured live, the SFU answers every re-join of a participant whose
+	// media sessions died with the rotation with "close 4000: TIE-0003" and
+	// keeps doing so until the session ages out, poisoning even app-level
+	// reconnects. The recovery that works is exactly what a manual
+	// disconnect/reconnect does: fetch fresh connection info (same
+	// conference URL - the room - but a brand-new peer session +
+	// media-server URL) and dial that. This goroutine owns the next dial,
+	// hence the rotating gate; scheduleReconnect stays silent meanwhile so
+	// the read-error path does not race a stale-identity join onto the SFU.
+	t.rotating.Store(true)
+	t.connMu.Lock()
+	conn := t.conn
+	t.conn = nil
+	t.connMu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+	settleSec, _ := strconv.Atoi(envOrDefault("TELEMOST_ROTATE_SETTLE_SEC", "2"))
+	utils.SafeGo("telemost.rotate", func() {
+		defer t.rotating.Store(false)
+		if settleSec > 0 {
+			select {
+			case <-time.After(time.Duration(settleSec) * time.Second):
+			case <-t.Done():
+				return
+			}
+		}
+		var err error
+		for attempt := 0; attempt < 3 && t.IsRunning(); attempt++ {
+			if err = t.getConnectionInfo(); err == nil {
+				break
+			}
+			utils.Debugf("[Telemost] rotation re-join fetch failed (%d/3): %v [%s]",
+				attempt+1, err, roleStr(t.isExitNode))
+			select {
+			case <-time.After(2 * time.Second):
+			case <-t.Done():
+				return
+			}
+		}
+		if !t.IsRunning() {
+			return
+		}
+		if err != nil {
+			// Fresh identity unavailable; fall back to the stale-session
+			// dial - it is what scheduleReconnect would have done anyway.
+			t.scheduleReconnect(-1)
+			return
+		}
+		t.stats.Reconnects.Add(1)
+		t.connectWS(0)
+	})
+	return true
 }
 
 func (t *TelemostTransport) getConnectionInfo() error {
@@ -441,6 +575,11 @@ func (t *TelemostTransport) connectWS(attempt int) {
 func (t *TelemostTransport) scheduleReconnect(attempt int) {
 	next := attempt + 1
 	if !t.IsRunning() || next >= t.GetConfig().MaxReconnectAttempts {
+		return
+	}
+	if t.rotating.Load() {
+		// rotateMediaPath's goroutine is re-joining with a fresh session;
+		// a dial here would race it with the poisoned old identity.
 		return
 	}
 	d := reconnectBackoff(next)
@@ -2927,6 +3066,19 @@ func (t *TelemostTransport) readSharingVideoTrack(track *webrtc.TrackRemote) {
 	var rx struct{ pkts, gaps, late, bad atomic.Uint64 }
 	var lastSeq uint16
 	haveSeq := false
+	// Downlink path watchdog tuning, read once: a window counts when at
+	// least this many packets were seen, and this many consecutive lossy
+	// windows justify rotating the session (see rotateMediaPath).
+	var prevPkt, prevGap uint64
+	badWindows := 0
+	rotatePct := 25.0
+	if v, err := strconv.Atoi(envOrDefault("TELEMOST_ROTATE_GAP_PCT", "25")); err == nil && v > 0 {
+		rotatePct = float64(v)
+	}
+	rotateWin := 3
+	if v, err := strconv.Atoi(envOrDefault("TELEMOST_ROTATE_WINDOWS", "3")); err == nil && v > 0 {
+		rotateWin = v
+	}
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {
@@ -2943,6 +3095,32 @@ func (t *TelemostTransport) readSharingVideoTrack(track *webrtc.TrackRemote) {
 				t.laneIndex(), got, gaps, 100*float64(gaps)/float64(max(got+gaps, 1)), rx.late.Load(), rx.bad.Load(),
 				t.stats.RTPSendSuccess.Load(), t.rtxStats.asked.Load(), t.rtxStats.resent.Load(),
 				100*float64(t.uplinkLoss.Load())/256, roleStr(t.isExitNode))
+			dPkt, dGap := got-prevPkt, gaps-prevGap
+			prevPkt, prevGap = got, gaps
+			minPkts, _ := strconv.Atoi(envOrDefault("TELEMOST_ROTATE_MINPKTS", "100"))
+			if dPkt+dGap >= uint64(minPkts) {
+				// The stream is actually flowing, so the gap delta is a
+				// loss measurement rather than silence. Healthy windows
+				// measure well below a percent; double-digit percentages
+				// held across several windows are the bad-tuple signature.
+				pct := 100 * float64(dGap) / float64(dPkt+dGap)
+				if pct >= rotatePct {
+					badWindows++
+					if badWindows >= rotateWin {
+						if t.rotateMediaPath(pct, badWindows) {
+							badWindows = 0
+						}
+					}
+				} else {
+					badWindows = 0
+					if pct < rotatePct/4 {
+						// A genuinely clean flowing window means the current
+						// path is fine; let the session spend its rotation
+						// budget afresh later.
+						t.pathRotations.Store(0)
+					}
+				}
+			}
 		}
 	}()
 	rtpBuf := make([]byte, 1500)
