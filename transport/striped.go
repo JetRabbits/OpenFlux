@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/JetRabbits/OpenFlux/utils"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // StripedTransport spreads frames over several child transports (lanes), puts
@@ -70,6 +70,7 @@ type StripedTransport struct {
 
 	pumpMu sync.Mutex
 	pumps  []chan struct{} // wake-ups of the lanes that cannot pull
+	wakers []LaneWaker     // pulling lanes that sleep while there is nothing
 
 	stopOnce sync.Once
 	done     chan struct{}
@@ -77,10 +78,21 @@ type StripedTransport struct {
 
 const maxStripeLanes = 64
 
+// MaxLanes is the most lanes a stripe runs, so a carrier can cap how many
+// rooms/channels it opens.
+func MaxLanes() int { return maxStripeLanes }
+
 // FramePuller is a lane whose send clock takes frames from a source on every
 // tick (up to max of them) instead of draining a queue filled by Send.
 type FramePuller interface {
 	SetFrameSource(src func(max int) [][]byte)
+}
+
+// LaneWaker is a FramePuller that sleeps while the stripe has nothing for it
+// (a WebSocket lane has no clock of its own to tick on); Wake tells it there
+// is something now. It must not block.
+type LaneWaker interface {
+	Wake()
 }
 
 // LossReporter is implemented by lanes that know their recent uplink loss
@@ -127,67 +139,34 @@ func envMs(name string, def int) time.Duration {
 }
 
 var (
+	// stripePieceBytes is the most a piece carries: one lane fragment
+	// (TELEMOST_FRAG_BYTES minus its 8-byte header) minus the stripe header
+	// and flag, so every piece is exactly one lane packet.
+	stripePieceBytes = envIntOr("STRIPE_PIECE_BYTES", envIntOr("TELEMOST_FRAG_BYTES", 1312)-8-stripeHeader-1)
+
 	// ackInterval is how often the receiver acks while data flows.
 	ackInterval = envMs("STRIPE_ACK_MS", 10)
 
-	// CoDel on the shared send queue drops at the head for a whole
-	// codelInterval when the queue sits over codelTarget too long.
+	// holeDeadline is how long a hole may hold later frames back before it is
+	// given up on. Retransmission normally fills it in one or two round trips,
+	// but the SFU now and then stops forwarding every lane for a few seconds
+	// (it renegotiates the subscriptions when someone joins or leaves); the
+	// tunnel's TCP waits that out (see tcpMinRTO) and loses nothing.
+	holeDeadline = envMs("STRIPE_HOLE_MS", 5000)
+
+	// CoDel on the shared send queue: when the oldest frame has waited longer
+	// than codelTarget for a whole codelInterval, drop at the head, faster
+	// while it lasts. The carrier's rate swings by half from second to second
+	// and the tunnel's round trip is 100-500 ms: with a 30 ms target every
+	// swing cost TCP a drop and seconds of regrowth (between two phones, 3
+	// lanes: 1.2-1.7 MB/s on average against 3.0-3.2 with these values, the
+	// same lanes and pacing).
+	codelTarget   = envMs("STRIPE_CODEL_TARGET_MS", 150)
 	codelInterval = envMs("STRIPE_CODEL_INTERVAL_MS", 600)
 
 	// sendQueueLimit bounds the send queue (bytes) whatever CoDel decides.
 	sendQueueLimit = envIntOr("STRIPE_QUEUE_BYTES", 4<<20)
 )
-
-// stripePieceBytes, holeDeadline and codelTarget are read on the transports'
-// pump/ack/stats goroutines, and the tests in this package retune them while
-// earlier tests' straggler goroutines may still be pumping the same test
-// binary — plain vars there are a data race (CI -race caught a scale-test
-// write against (*sender).codelShouldDrop's read). They live in atomics
-// behind the typed accessors below; the env vars are still read exactly once
-// at init, with the same defaults, and giveUpAfter still freezes from that
-// initial holeDeadline (reconfiguring holeDeadline never moves it).
-var (
-	stripePieceBytesV atomic.Uint64 // bytes, via stripePieceBytes()/setStripePieceBytes()
-	holeDeadlineV     atomic.Uint64 // ns, via holeDeadline()/setHoleDeadline()
-	codelTargetV      atomic.Uint64 // ns, via codelTarget()/setCodelTarget()
-)
-
-func init() {
-	hd := envMs("STRIPE_HOLE_MS", 5000)
-	stripePieceBytesV.Store(uint64(envIntOr("STRIPE_PIECE_BYTES", envIntOr("TELEMOST_FRAG_BYTES", 1312)-8-stripeHeader-1)))
-	holeDeadlineV.Store(uint64(hd))
-	codelTargetV.Store(uint64(envMs("STRIPE_CODEL_TARGET_MS", 150)))
-	giveUpAfter = hd + 3*time.Second
-}
-
-// stripePieceBytes is the most a piece carries: one lane fragment
-// (TELEMOST_FRAG_BYTES minus its 8-byte header) minus the stripe header
-// and flag, so every piece is exactly one lane packet.
-func stripePieceBytes() int { return int(stripePieceBytesV.Load()) }
-
-// holeDeadline is how long a hole may hold later frames back before it is
-// given up on. Retransmission normally fills it in one or two round trips,
-// but the SFU now and then stops forwarding every lane for a few seconds
-// (it renegotiates the subscriptions when someone joins or leaves); the
-// tunnel's TCP waits that out (see tcpMinRTO) and loses nothing.
-func holeDeadline() time.Duration { return time.Duration(holeDeadlineV.Load()) }
-
-// codelTarget is CoDel's queue-delay target: when the oldest frame has
-// waited longer than codelTarget for a whole codelInterval, drop at the
-// head, faster while it lasts. The carrier's rate swings by half from
-// second to second and the tunnel's round trip is 100-500 ms: with a 30 ms
-// target every swing cost TCP a drop and seconds of regrowth (between two
-// phones, 3 lanes: 1.2-1.7 MB/s on average against 3.0-3.2 with these
-// values, the same lanes and pacing).
-func codelTarget() time.Duration { return time.Duration(codelTargetV.Load()) }
-
-// The setters exist for the tests in this package (which tune these knobs
-// for whole tests, as the env vars tune them for a process); a store lands
-// atomically for every goroutine reading through the accessors.
-
-func setStripePieceBytes(n int)       { stripePieceBytesV.Store(uint64(n)) }
-func setHoleDeadline(d time.Duration) { holeDeadlineV.Store(uint64(d)) }
-func setCodelTarget(d time.Duration)  { codelTargetV.Store(uint64(d)) }
 
 // laneReorderSlack: a piece counts as lost once a piece that left more than
 // this many transmissions after it on the same lane has been acked. A lane is
@@ -209,6 +188,32 @@ type WatchSource interface {
 // LaneIDer is a lane with an identity the far side can name in a watch list.
 type LaneIDer interface {
 	LaneID() string
+}
+
+// StripeOptions tune a stripe for its carrier. The defaults fit Telemost:
+// small pieces (one SFU packet), lanes that lose packets, a round trip of a
+// few hundred milliseconds. Lanes over a WebSocket (cups.online, Avito) carry
+// whole messages of kilobytes, lose nothing while the socket is up and may
+// take a second to answer a big message.
+type StripeOptions struct {
+	// PieceBytes is the most one piece carries (0: the default).
+	PieceBytes int
+	// DeadAfter is how long a lane that keeps sending may hear nothing back
+	// before it counts as dead and only probes (0: the default, 600 ms).
+	DeadAfter time.Duration
+	// NoDups turns off the spare-room copies of overdue pieces: a lane that
+	// does not lose packets only wastes its turn on them.
+	NoDups bool
+}
+
+// SetOptions applies o; call it before Start.
+func (s *StripedTransport) SetOptions(o StripeOptions) {
+	s.snd.mu.Lock()
+	defer s.snd.mu.Unlock()
+	s.snd.pieceBytes, s.snd.noDups = o.PieceBytes, o.NoDups
+	for i := range s.snd.lane {
+		s.snd.lane[i].deadAfter = o.DeadAfter
+	}
 }
 
 // NewStripedTransport bonds lanes into one transport. Both ends must stripe.
@@ -266,6 +271,11 @@ func (s *StripedTransport) attach(idx int, l Transport) {
 	l.Receive(func(b []byte) { s.onLane(idx, b) })
 	if p, ok := l.(FramePuller); ok {
 		p.SetFrameSource(func(max int) [][]byte { return s.pull(idx, max) })
+		if w, ok := l.(LaneWaker); ok {
+			s.pumpMu.Lock()
+			s.wakers = append(s.wakers, w)
+			s.pumpMu.Unlock()
+		}
 		return
 	}
 	wake := make(chan struct{}, 1)
@@ -305,6 +315,9 @@ func (s *StripedTransport) wakePumps() {
 		case w <- struct{}{}:
 		default:
 		}
+	}
+	for _, w := range s.wakers {
+		w.Wake()
 	}
 	s.pumpMu.Unlock()
 }
@@ -707,7 +720,7 @@ func (s *StripedTransport) autoscaleLoop() {
 		ceilingAt       time.Time
 		rateBefore      float64
 	)
-	kbs := func(pieces float64) float64 { return pieces * float64(stripePieceBytes()) / 1000 }
+	kbs := func(pieces float64) float64 { return pieces * float64(stripePieceBytes) / 1000 }
 	for {
 		select {
 		case <-s.done:
@@ -814,6 +827,18 @@ type sender struct {
 	minRTT       time.Duration
 	minRTTAt     time.Time
 	triesLogAt   time.Time
+
+	// Per-stripe overrides of the Telemost-tuned defaults; see StripeOptions.
+	pieceBytes int
+	noDups     bool
+}
+
+// piece is the most one piece carries on this stripe.
+func (q *sender) piece() int {
+	if q.pieceBytes > 0 {
+		return q.pieceBytes
+	}
+	return stripePieceBytes
 }
 
 type queuedFrame struct {
@@ -951,7 +976,7 @@ func (q *sender) pull(i, max int, now time.Time) [][]byte {
 		q.pieces++
 		out = append(out, buf)
 	}
-	if len(out) < max && !dead && dupOn {
+	if len(out) < max && !dead && dupOn && !q.noDups {
 		out = q.duplicates(i, max, now, out)
 	}
 	// Held back: everything the tick allowed went out - by the pace or, at
@@ -1046,8 +1071,8 @@ func (q *sender) nextPiece(now time.Time) []byte {
 		q.cur, q.curStarted = f, false
 	}
 	n := len(q.cur)
-	if pb := stripePieceBytes(); n > pb {
-		n = pb
+	if n > q.piece() {
+		n = q.piece()
 	}
 	flag := byte(0)
 	if q.curStarted {
@@ -1087,7 +1112,7 @@ func (q *sender) dequeue(now time.Time) ([]byte, bool) {
 
 func (q *sender) codelShouldDrop(sojourn time.Duration, now time.Time) bool {
 	okToDrop := false
-	if sojourn < codelTarget() || q.queueBytes < 2*stripePieceBytes() {
+	if sojourn < codelTarget || q.queueBytes < 2*q.piece() {
 		q.codelFirstAbove = time.Time{}
 	} else if q.codelFirstAbove.IsZero() {
 		q.codelFirstAbove = now.Add(codelInterval)
@@ -1280,11 +1305,10 @@ func (q *sender) detectLocked(now time.Time) bool {
 	return added
 }
 
-// giveUpAfter is how long the sender keeps resending a piece: longer than
-// the receiver waits on a hole (holeDeadline), so a live receiver has given
-// up on it first. Frozen from the env-derived holeDeadline at init (see the
-// knob block above): tests retune holeDeadline without moving this.
-var giveUpAfter time.Duration
+// giveUpAfter is how long the sender keeps resending a piece: longer than the
+// receiver waits on a hole (holeDeadline), so a live receiver has given up
+// on it first.
+var giveUpAfter = holeDeadline + 3*time.Second
 
 // tickLanes rolls the lanes' loss figures.
 func (q *sender) tickLanes(now time.Time) {
@@ -1371,12 +1395,6 @@ func (q *sender) snapshot() senderStats {
 type reorderBuffer struct {
 	mu      sync.Mutex
 	started bool
-	// deadline is holeDeadline captured at construction: a buffer that
-	// outlives its transport must not read the package-level knob while a
-	// test (or a future reconfigure) rewrites it — that race showed up as a
-	// flaky -race failure between reorder tests.
-	deadline time.Duration
-
 	next    uint32
 	hi      uint32 // highest seq seen
 	gen     uint64 // bumped by every new piece
@@ -1405,7 +1423,7 @@ type reorderOut struct {
 }
 
 func newReorderBuffer(deliver func([]byte, bool)) *reorderBuffer {
-	r := &reorderBuffer{deadline: holeDeadline(), ring: make([]reorderSlot, reorderWindow), out: make(chan reorderOut, 8192)}
+	r := &reorderBuffer{ring: make([]reorderSlot, reorderWindow), out: make(chan reorderOut, 8192)}
 	go func() {
 		for o := range r.out {
 			deliver(o.b, o.gap)
@@ -1528,7 +1546,7 @@ func (r *reorderBuffer) run(done chan struct{}) {
 		for r.count > 0 {
 			low := r.lowestLocked(r.next + reorderWindow)
 			waited := time.Since(r.ring[low%reorderWindow].at)
-			if waited <= r.deadline {
+			if waited <= holeDeadline {
 				break
 			}
 			utils.Infof("[STRIPE] gave up on %d piece(s) from seq %d after %s", low-r.next, r.next, waited.Round(time.Millisecond))

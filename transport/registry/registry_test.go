@@ -12,12 +12,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/JetRabbits/OpenFlux/transport"
-	"github.com/JetRabbits/OpenFlux/transport/cupsonline"
-	"github.com/JetRabbits/OpenFlux/transport/mailru"
-	"github.com/JetRabbits/OpenFlux/transport/oneme"
-	"github.com/JetRabbits/OpenFlux/transport/script"
-	"github.com/JetRabbits/OpenFlux/transport/yandex"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/avito"
+	"github.com/p1neappleXpress/OpenFlux/transport/cupsonline"
+	"github.com/p1neappleXpress/OpenFlux/transport/mailru"
+	"github.com/p1neappleXpress/OpenFlux/transport/oneme"
+	"github.com/p1neappleXpress/OpenFlux/transport/script"
+	"github.com/p1neappleXpress/OpenFlux/transport/yandex"
 )
 
 func opts() Options { return Options{Base: transport.DefaultConfig()} }
@@ -30,6 +31,7 @@ func TestEveryNativeTypeBuilds(t *testing.T) {
 		"boards":     &yandex.BoardsTransport{},
 		"mailru":     &mailru.MailruDocsTransport{},
 		"cupsonline": &cupsonline.CupsonlineTransport{},
+		"avito":      &avito.AvitoTransport{},
 		"oneme":      &oneme.OneMeTransport{},
 		"direct":     &transport.DirectTransport{},
 	}

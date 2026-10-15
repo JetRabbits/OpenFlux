@@ -23,6 +23,86 @@ All notable changes to the OpenFlux core. Format loosely follows
   just pipeline less. Bulk throughput is unchanged (the same 12 KB batches, 16 calls for
   a 160-frame test stream); the first frame's RTT no longer waits for the previous
   call's reply.
+## [0.7.3] - 2026-10-14
+
+### Changed
+
+- **Mail.ru is much faster.** The Mail.ru docs server cuts an anonymous editor after about a dozen
+  chat messages no matter how big they are, so the tunnel now coalesces far more into each message
+  before that cut — end-to-end throughput rises from tens of KB/s to roughly 800 KB/s per burst.
+  Only the Mail.ru carrier changes its default batch size; every other transport is byte-for-byte
+  unchanged, and `OPENFLUX_BATCH_BYTES` still overrides it.
+
+## [0.7.2] - 2026-10-13
+
+### Fixed
+
+- **A cups.online or Avito exit node could not be started on the phone**: the app asked for a document link
+  ("Ссылка на документ не указана"), but an exit of these two given no room list is the one that creates its
+  rooms. It starts now, and the link it shares carries the rooms it created (for Avito the list was left out).
+- **An Avito socket that dropped could crash the whole process** (the exit node, or the app): its reader went on
+  using the connection after it had been cleared, or read the next connection next to that one's own reader.
+  Each reader now keeps to its own socket and is waited for.
+
+## [0.7.1] - 2026-10-13
+
+0.7.0 was cut from a branch that did not carry 0.6.0 and 0.6.1, so it lost the Mail.ru chat-channel fix
+(Mail.ru answered "access deny" 4004 again) and the node's `.flux` auto-updater. 0.7.1 is 0.6.1 plus
+everything in 0.7.0, plus the fixes below.
+
+### Added
+
+- **avito (code.avito.ru) carrier**, and `avito` in share links.
+- **cups.online and avito run as stripes.** Each cups room (each avito room pair) is one lane of a reliable
+  striped link (sequence numbers, reorder, retransmission), so a message the server loses no longer breaks
+  the tunnel's byte stream, and speed adds up across rooms. A fresh exit prints a new room list format
+  (`{"v":2,...}`); an old bare list keeps the old wire, so running nodes and older apps keep working, but
+  an older app cannot use a new list. `CUPS_STRIPE=0` / `AVITO_STRIPE=0` make an exit print the old list.
+  `CUPS_ROOMS` sets how many rooms a fresh cups exit creates (default 4).
+
+### Fixed
+
+- **cups.online crawled at 25-90 KB/s.** The transport fired a message every 12 ms with no feedback; the
+  server relays a room only at ~130-200 KB/s and silently drops the rest from the relay (the send is still
+  acknowledged), so about 70% of what was sent never arrived and the retransmissions stalled the tunnel.
+  A lane now keeps at most 3 messages unanswered and sends the next one when the server answers, so it
+  follows each room's real rate; messages carry 12 KB instead of 8 KB. Through the tunnel, 4 rooms: 20 MB
+  at 424 KB/s (was 90 KB/s), retransmissions 2% instead of more than the data itself. `CUPS_WINDOW`
+  tunes the window (0 turns it off).
+- **avito sent one packet per round trip** (the chunk size never applied); an operation now carries up to
+  256 KB of framed packets, and its send/read loops stop with their socket instead of outliving a reconnect.
+- **A striped cups lane corrupted frames**: it kept slices of a receive buffer the socket reused.
+
+## [0.6.1] - 2026-10-13
+
+### Fixed
+
+- **The Mail.ru carrier dropped every connection with "access deny" (code 4004).** The current Mail.ru editor
+  server (R7/OnlyOffice 2026.2.1.2268) validates cursor and `saveChanges` writes against the live document
+  model and closes the socket on any synthetic one, so the transport's old trick of stuffing tunnel bytes into
+  the cursor field stopped working entirely. The data path now rides the document's **chat channel**
+  (`type:"message"`), which the server relays verbatim to the other participant without validating it against
+  the document: tunnelled bytes are tagged and base64-encoded there, the server's echo of our own chat and a
+  human's chat are skipped on receive, and the old cursor keep-alive and `saveChanges` "editor activity" are
+  gone (the Socket.IO ping/pong keeps the socket up). Both the native transport and its scripted (`.flux`)
+  port carry data this way now.
+- **The scripted Mail.ru carrier could not connect at all (HTTP 409 on the WebSocket upgrade).** `ws.open`
+  now offers permessage-deflate when a script asks for it (`{compress: true}`) — Mail.ru's nginx rejects the
+  upgrade without it — and sends `Accept-Language`, the same two fixes the native transport already carried.
+
+## [0.6.0] - 2026-10-12
+
+### Added
+
+- **A node can keep its scripted (`.flux`) transports current and self-heal, with no restart.** The new
+  `--script-auto-update` flag turns on a headless updater — the counterpart of the app's updater for a CLI or
+  exit node that has no GUI. It checks each `.flux` carrier's author feed on the usual schedule and installs
+  an update when the core vouches for it (first-party key, same wire); and when a carrier keeps failing to
+  connect it walks a recovery ladder: check for a newer package now, then roll back to the previous one, then
+  fall back to the native transport of the same service. An applied or rolled-back package is **hot-swapped**
+  into the live session, so only that one carrier blinks while it reconnects — the handshake, the other
+  carriers and the packet flow stay up. `--script-update-channel` selects `stable` or `nightly`. Off by
+  default, so node behaviour is unchanged unless asked for.
 
 ## [0.5.1] - 2026-10-11
 

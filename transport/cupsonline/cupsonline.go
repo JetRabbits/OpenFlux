@@ -1,139 +1,106 @@
-// Package cupsonline implements a covert tunnel over interview.cups.online
-// rooms (Centrifugo 4.1.5 websocket + Django RPC validation).
-//
-// Data channel: shared_editor_change_code. The room's shared code document is
-// the carrier: each side (exit = "X", client = "Y") owns a fenced block of
-// lines at the END of the document ("//OCX-<roomidx>-BEGIN" ... "-END") whose
-// body is the length-prefixed packet batch, base64'd and chunked into short
-// lines. A send computes the document with our block replaced, expresses the
-// edit as the server's own patch dialect (see makeDiff — CHARACTER (rune)
-// offsets, not line numbers: " " keep-chunk verifies context at the rune
-// offset, "-" deletes, "+" inserts, each one percent-encoded chunk with \n
-// inside as %0A), and ships it through the "shared_editor_change_code" RPC.
-// The change_code reply carries the FULL new document: on success we adopt it
-// as baseline; if it differs from what we expected (the server SILENTLY
-// no-ops — version bump, document untouched — when the patch does not match
-// at its offsets) we refetch shared_editor_room_info and retry against the
-// fresh document (bounded). Receivers strip their own block, decode the
-// peer's block, and dedupe repeat code_update pushes by version + payload
-// hash (our own edits echo back to us).
-//
-// Why not cursors: until 2026-10 data rode in the "column" field of
-// shared_editor_change_cursors as base64. In October 2026 the server started
-// validating cursor fields as integers ("Введите правильное число." on any
-// string column), which kills the cursor channel outright — every send is
-// rejected with a 400 and nothing relays. The code-editing RPC above is the
-// live replacement observed in a real browser protocol capture: it still
-// accepts arbitrary percent-encoded text and still broadcasts to everyone.
-//
-// The writer PIPELINES: up to MaxInflightBatches change_code calls ride the
-// wire at once per channel, each built optimistically on the predicted
-// document of the writes still in flight, replies applied asynchronously by
-// version monotonicity, one rebase+retransmit for a write the server did not
-// apply. The wire format (diff dialect, framing, chunking) is untouched —
-// only the scheduling changed, so old clients interop, they just pipeline
-// less.
 package cupsonline
 
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 
-	"github.com/JetRabbits/OpenFlux/transport"
-	"github.com/JetRabbits/OpenFlux/utils"
+	"github.com/p1neappleXpress/OpenFlux/netbind"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
-const (
-	baseRoomURL = "https://interview.cups.online/live-coding/"
-
-	cupsUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
-)
-
-// roomBaseURL is the live room endpoint the transport actually talks to. It is
-// a package-level seam over baseRoomURL so in-package tests can point the
-// constructors at a fake cups.online deployment (httptest). Production code
-// never reassigns it.
-var roomBaseURL = baseRoomURL
+// baseRoomURL is where the rooms live. It's a variable only so tests can aim
+// the transport at a local stand-in for cups.online.
+var baseRoomURL = "https://interview.cups.online/live-coding/"
 
 // SetBaseRoomURL aims the transport at another server and returns what puts
 // the old address back. For tests only (a fake cups.online, in this package's
 // tests and in the native-vs-JS interop tests of transport/script).
 func SetBaseRoomURL(u string) (restore func()) {
-	old := roomBaseURL
-	roomBaseURL = u
-	return func() { roomBaseURL = old }
+	old := baseRoomURL
+	baseRoomURL = u
+	return func() { baseRoomURL = old }
 }
+
+const cupsUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
 
 type CupsonlineConfig struct {
 	WSHandshakeTimeout  time.Duration
 	WSReadTimeout       time.Duration
+	WSWriteTimeout      time.Duration
 	KeepAliveInterval   time.Duration
 	ReconnectMinDelay   time.Duration
 	ReconnectMaxDelay   time.Duration
 	ReconnectMultiplier float64
 	HTTPTimeout         time.Duration
 
-	// Батчинг внутри одного WS. 32 KB — потолок Centrifugo (64 KB push).
+	// Комнату, похожую на закрытую, проверяем не чаще этого: от Min с
+	// удвоением до Max. Каждая такая проверка может заставить cups выдать
+	// новую комнату, так что долбить её нельзя.
+	RoomGoneRetryMin time.Duration
+	RoomGoneRetryMax time.Duration
+
+	// Батчинг внутри одного WS. Данные едут в целых row/column курсоров
+	// (bytesPerNumber байт на число, два числа на курсор): cups.online больше
+	// не принимает строку в column, но массив целых курсоров ретранслирует
+	// как есть, дословно и по порядку.
+	//
+	// BatchMaxBytes — сколько байт пакетов копится за одну отправку.
+	// MaxMessageData — сколько байт едет в одном сообщении: на проводе число
+	// стоит ~4× своих байт, поэтому пачка режется на несколько сообщений,
+	// каждое заведомо под потолком сервера (проверено probe'ом: ~21 KB
+	// проходит, ~44 KB уже нет), а приёмная сторона склеивает их по порядку.
+	// MaxCursors — страховочный потолок массива в одном сообщении.
 	BatchMaxPackets int
 	BatchMaxBytes   int
+	MaxMessageData  int
+	MaxCursors      int
+	BatchTimeout    time.Duration
 
-	// BatchTimeout is the maximum dwell of a batch from its FIRST queued
-	// frame: sustained streams fill to MaxCodeBytesPerBatch long before it
-	// expires, and an idle sender flushes earlier through BatchIdleFlush.
-	// Every send rewrites our whole block, so the document itself is the
-	// cost of a change_code call — the dwell exists to make each call carry
-	// ≳10KB of payload instead of one tunnel packet (~1.3KB) against a
-	// ~30KB document.
-	BatchTimeout time.Duration
+	// SendInterval is the least time between two messages on one channel: a
+	// floor against micro-bursts, not the main throttle. On the striped wire
+	// the pace is set by SendWindow (ack feedback), so this only keeps two
+	// messages from leaving the same instant.
+	SendInterval time.Duration
 
-	// MaxInflightBatches is the per-channel write window: how many
-	// change_code calls may be OUTSTANDING (sent, reply not yet processed)
-	// at once. The writer no longer blocks on one call's reply before
-	// dispatching the next — responses are applied asynchronously by version
-	// monotonicity, and a write that the server did not apply gets one
-	// rebase+retransmit while the rest of the window proceeds. When the
-	// window is full the send loop stops draining the queue, so backpressure
-	// upstream is exactly what a serial writer produced. 1 = the old
-	// stop-and-wait schedule.
-	MaxInflightBatches int
-
-	// BatchIdleFlush flushes a partially filled batch this long after the
-	// last frame when the send queue has drained (interactive traffic:
-	// browsing must not pay the full dwell). A still-arriving stream keeps
-	// batching until the dwell or the byte cap.
-	BatchIdleFlush time.Duration
-
-	// MaxCodeBytesPerBatch limits the framed payload carried in ONE
-	// shared_editor_change_code call (base64 of it lands in the room code
-	// document). Keeps the total document around template + 2 blocks well
-	// under the Centrifugo push ceiling (~34KB total).
-	// We own only our own block, so an oversized doc always self-heals: the
-	// next send replaces our whole block with a fresh bounded payload.
-	MaxCodeBytesPerBatch int
+	// SendWindow is how many cursor RPCs a striped lane keeps in flight
+	// before it waits for a reply. cups.online relays a room only so fast
+	// (benchmarked ~130-200 KB/s delivered per room, the shard decides);
+	// firing faster than that is dropped silently from the relay fan-out, so
+	// a lane with no feedback wastes most of what it sends (measured 71% loss
+	// at the old 12 ms cadence) and the stripe then spends retransmissions on
+	// the drops and stalls the tunnel's TCP head-of-line. Bounding the RPCs in
+	// flight makes a slow room (or a slow uplink) push back instead: the lane
+	// sends again only once the server has answered, so it self-paces to each
+	// room's true rate with no relay loss. 3 was the knee in the live sweep
+	// (2 underran, 4 began to overrun); 0 turns the gate off.
+	SendWindow int
 
 	SendQueueSize int
 
+	// Буферы сокета, а не лимит на сообщение: gorilla выделяет их целиком на
+	// каждое соединение. MaxMessageBytes — сколько может прийти одним фреймом.
 	ReadBufferSize  int
 	WriteBufferSize int
+	MaxMessageBytes int
 
 	MaxPayloadBytes int
 
@@ -145,46 +112,50 @@ type CupsonlineConfig struct {
 
 func DefaultCupsonlineConfig() CupsonlineConfig {
 	return CupsonlineConfig{
-		WSHandshakeTimeout:  15 * time.Second,
-		WSReadTimeout:       300 * time.Second,
+		WSHandshakeTimeout: 15 * time.Second,
+		// Сервер пингует каждые ~25 с и отвечает на наш keepalive раз в 20 с,
+		// так что полторы минуты тишины — это мёртвое соединение.
+		WSReadTimeout:       90 * time.Second,
+		WSWriteTimeout:      15 * time.Second,
 		KeepAliveInterval:   20 * time.Second,
 		ReconnectMinDelay:   100 * time.Millisecond,
 		ReconnectMaxDelay:   10 * time.Second,
 		ReconnectMultiplier: 1.3,
 		HTTPTimeout:         30 * time.Second,
 
-		// BatchMaxBytes остаётся жёстким потолком пакета (probe-era legacy);
-		// фактический гейт отправки — Min(BatchMaxBytes, MaxCodeBytesPerBatch),
-		// т.к. payload теперь живёт в тексте комнаты (base64 ×4/3).
-		//
-		// The dwell/cap pair below targets ≳12KB of payload per
-		// change_code call: the tunnel hands us ~1.3KB per Send (one gVisor
-		// packet; StripedTransport fragments to 1294B pieces), and EVERY
-		// call rewrites our whole block against a ~30KB document, so a
-		// per-packet flush costs ~40:1 wire amplification. 12KB batches put
-		// that back at ~2.5:1; BatchIdleFlush keeps a drained queue (plain
-		// browsing) from waiting out the dwell.
-		BatchMaxPackets: 64,
-		BatchMaxBytes:   32 * 1024,
-		BatchTimeout:    30 * time.Millisecond,
-		BatchIdleFlush:  12 * time.Millisecond,
+		RoomGoneRetryMin: time.Minute,
+		RoomGoneRetryMax: 30 * time.Minute,
 
-		// Three writes in flight per channel: a tunnel RTT through the exit
-		// is 0.5-1 s, and a stop-and-wait writer spends one whole RTT per
-		// change_code call (measured: 2.3-3.8 s TTFB idle for a 100-byte
-		// HTTPS request, 4-6 RTTs of handshake pipelined through it). A
-		// window of 3 lets the next batches ride while one call is still in
-		// the air.
-		MaxInflightBatches: 3,
+		BatchMaxPackets: 256,
+		BatchMaxBytes:   22000,
+		// 12288 bytes of data → ~2050 cursor integers → ~38 KB on the wire;
+		// the live relay bench delivers 0% loss up to here, ~200 KB/s per
+		// room (vs 134 at 8192), while 16000 trips the server's 1009
+		// "message too big". The far side reassembles by the length prefix,
+		// so a peer that still chunks at 8192 interops.
+		MaxMessageData: 12288,
+		// 12288 data bytes pack into ~1025 cursor integers; the live server
+		// takes well over 2000 in one message, so this headroom is safe.
+		MaxCursors:   1100,
+		BatchTimeout: 2 * time.Millisecond,
+		// A small floor only; SendWindow is the throttle now. (The old 12 ms
+		// fixed cadence ignored how fast the room actually relayed and lost
+		// ~71% of what it sent — see SendWindow.)
+		SendInterval: 12 * time.Millisecond,
+		SendWindow:   3,
 
-		MaxCodeBytesPerBatch: 12288,
+		// В очереди кадры кодека (до ~8 KB), а не IP-пакеты: очередь длиннее
+		// — это уже не буфер, а секунды задержки.
+		SendQueueSize: 1024,
 
-		SendQueueSize: 65536,
+		ReadBufferSize:  64 << 10,
+		WriteBufferSize: 64 << 10,
+		MaxMessageBytes: 8 << 20,
 
-		ReadBufferSize:  32 << 20,
-		WriteBufferSize: 32 << 20,
-
-		MaxPayloadBytes: 16_000_000,
+		// Длина пакета во внутреннем кадре — uint16, так что один пакет не
+		// может быть больше 65535 байт. Кадр кодека (до ~8 KB) с запасом
+		// помещается и режется на сообщения при отправке.
+		MaxPayloadBytes: 65535,
 
 		NumRooms:        4,
 		RoomCreatePause: 500 * time.Millisecond,
@@ -213,22 +184,26 @@ type cupsAuth struct {
 	csrfToken  string
 }
 
-func authorizeWithJar(roomURL string, jar http.CookieJar) (*cupsAuth, error) {
-	if jar == nil {
-		jar, _ = cookiejar.New(nil)
-	}
-	client := &http.Client{
-		Jar:     jar,
-		Timeout: 30 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return fmt.Errorf("too many redirects")
-			}
-			return nil
-		},
+// authorize loads a room page and collects what it takes to join the room's
+// channel. session carries the cookies of an earlier join over (nil starts a
+// fresh one), so re-joining doesn't add a new participant every time.
+func authorize(ctx context.Context, roomURL string, session *http.Client) (*cupsAuth, error) {
+	client := session
+	if client == nil {
+		jar, _ := cookiejar.New(nil)
+		client = &http.Client{
+			Jar:     jar,
+			Timeout: 30 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 5 {
+					return fmt.Errorf("too many redirects")
+				}
+				return nil
+			},
+		}
 	}
 
-	req, _ := http.NewRequest("GET", roomURL, nil)
+	req, _ := http.NewRequestWithContext(ctx, "GET", roomURL, nil)
 	req.Header.Set("User-Agent", cupsUA)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "ru-RU,ru;q=0.9")
@@ -239,6 +214,9 @@ func authorizeWithJar(roomURL string, jar http.CookieJar) (*cupsAuth, error) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		return nil, fmt.Errorf("%w: GET room status %d", errRoomGone, resp.StatusCode)
+	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("GET room status %d", resp.StatusCode)
 	}
@@ -252,14 +230,15 @@ func authorizeWithJar(roomURL string, jar http.CookieJar) (*cupsAuth, error) {
 		subURL:     firstMatch(reMetaSubURL, html),
 		httpClient: client,
 	}
-	for _, c := range jar.Cookies(mustParseURL(roomURL)) {
+	for _, c := range client.Jar.Cookies(mustParseURL(roomURL)) {
 		if c.Name == "csrftoken" {
 			a.csrfToken = c.Value
 			break
 		}
 	}
 	if a.roomUUID == "" || a.userUUID == "" {
-		return nil, fmt.Errorf("room/user uuid missing")
+		// A closed room's page renders without the room/user data.
+		return nil, fmt.Errorf("%w: room/user uuid missing", errRoomGone)
 	}
 	if a.connToken == "" || a.connURL == "" || a.subURL == "" {
 		return nil, fmt.Errorf("centrifuge meta missing")
@@ -270,7 +249,7 @@ func authorizeWithJar(roomURL string, jar http.CookieJar) (*cupsAuth, error) {
 	a.channel = fmt.Sprintf("$shared_editor:room-%s", a.roomUUID)
 
 	subBody, _ := json.Marshal(map[string]string{"channel": a.channel})
-	req2, _ := http.NewRequest("POST", a.subURL, bytes.NewReader(subBody))
+	req2, _ := http.NewRequestWithContext(ctx, "POST", a.subURL, bytes.NewReader(subBody))
 	req2.Header.Set("User-Agent", cupsUA)
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("X-CSRFToken", a.csrfToken)
@@ -300,41 +279,171 @@ func authorizeWithJar(roomURL string, jar http.CookieJar) (*cupsAuth, error) {
 	return a, nil
 }
 
-func authorize(roomURL string) (*cupsAuth, error) {
-	return authorizeWithJar(roomURL, nil)
+var (
+	// errRoomGone marks a room that no longer exists, as opposed to a network
+	// hiccup on the way to it.
+	errRoomGone = errors.New("комната не существует")
+	// errRefused marks Centrifugo turning our tokens down, with an error
+	// reply or by hanging up mid-handshake. Only a fresh join fixes that.
+	errRefused = errors.New("refused")
+	errNoRoom  = errors.New("cups: нет подключённой комнаты")
+	errStopped = errors.New("cups: транспорт остановлен")
+)
+
+func joinURL(roomUUID string) string { return baseRoomURL + "?room=" + roomUUID }
+
+// joinRoom enters an existing room. A room that's gone can come back as a
+// fresh one (a different uuid) instead of an error, so that counts as gone.
+func joinRoom(ctx context.Context, roomUUID string, session *http.Client) (*cupsAuth, error) {
+	a, err := authorize(ctx, joinURL(roomUUID), session)
+	if err != nil {
+		return nil, err
+	}
+	if a.roomUUID != roomUUID {
+		return nil, fmt.Errorf("%w: вместо неё выдана новая %s", errRoomGone, shortRoom(a.roomUUID))
+	}
+	return a, nil
 }
 
-func createRooms(baseURL string, n int, pause time.Duration) ([]*cupsAuth, error) {
+// readReply waits for the reply to command id. Centrifugo reports refusals
+// (expired token, unknown channel...) as {"error": ...} in the reply, which
+// used to be ignored - the channel then just sat there never receiving
+// anything. Centrifugo may also pack several messages into one frame, one per
+// line; whatever else comes along (a ping, a push) goes to other.
+func readReply(conn *websocket.Conn, timeout time.Duration, id int, what string, other func([]byte)) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		conn.SetReadDeadline(deadline)
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			var closeErr *websocket.CloseError
+			if errors.As(err, &closeErr) {
+				return fmt.Errorf("%w: %s: %v", errRefused, what, err)
+			}
+			return err
+		}
+		found := false
+		var refusal error
+		for _, line := range splitFrame(raw) {
+			if !found {
+				if ok, err := matchReply(line, id); ok {
+					found, refusal = true, err
+					continue
+				}
+			}
+			if other != nil {
+				other(line)
+			}
+		}
+		if refusal != nil {
+			return fmt.Errorf("%w: %s: %v", errRefused, what, refusal)
+		}
+		if found {
+			return nil
+		}
+	}
+}
+
+// matchReply reports whether line is the reply to command id, and the error
+// it carries if it is one.
+func matchReply(line []byte, id int) (bool, error) {
+	if isPing(line) {
+		return false, nil
+	}
+	var reply struct {
+		ID    int `json:"id"`
+		Error *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(line, &reply) != nil || reply.ID != id {
+		return false, nil
+	}
+	if reply.Error != nil {
+		return true, fmt.Errorf("%d %s", reply.Error.Code, reply.Error.Message)
+	}
+	return true, nil
+}
+
+// splitFrame takes apart a frame Centrifugo may have packed several messages
+// into, one per line. Parsing such a frame whole fails, which silently lost
+// every packet in it.
+func splitFrame(raw []byte) [][]byte {
+	var out [][]byte
+	for _, line := range bytes.Split(raw, []byte{'\n'}) {
+		if line = bytes.TrimSpace(line); len(line) > 0 {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// isPing reports a Centrifugo server ping, which must be answered in kind.
+func isPing(line []byte) bool { return string(line) == "{}" }
+
+func shortRoom(roomUUID string) string {
+	if len(roomUUID) > 8 {
+		return roomUUID[:8]
+	}
+	return roomUUID
+}
+
+// fmtUptime renders a duration the way the log reads best: "47ч12м", "3м05с".
+func fmtUptime(d time.Duration) string {
+	d = d.Round(time.Second)
+	h, m, s := int(d.Hours()), int(d.Minutes())%60, int(d.Seconds())%60
+	if h > 0 {
+		return fmt.Sprintf("%dч%02dм", h, m)
+	}
+	return fmt.Sprintf("%dм%02dс", m, s)
+}
+
+// parseRoomList pulls room uuids out of --url: the packed base64 list the
+// exit node prints, bare or as ?rooms=, or a single ?room=.
+func parseRoomList(rawURL string) []string {
+	ids, _ := parseRooms(rawURL)
+	return ids
+}
+
+// parseRooms is parseRoomList plus whether the list is in the striped format
+// (transport.PackRooms): a single ?room= (a phpbox exit) never is.
+func parseRooms(rawURL string) ([]string, bool) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil, false
+	}
+	if u, err := url.Parse(rawURL); err == nil {
+		q := u.Query()
+		if packed := q.Get("rooms"); packed != "" {
+			if ids, striped, err := transport.UnpackRooms(packed); err == nil {
+				return ids, striped
+			}
+		} else if single := q.Get("room"); single != "" {
+			return []string{single}, false
+		}
+	}
+	if ids, striped, err := transport.UnpackRooms(rawURL); err == nil {
+		return ids, striped
+	}
+	return nil, false
+}
+
+func createRooms(ctx context.Context, baseURL string, n int, pause time.Duration) ([]*cupsAuth, error) {
 	if baseURL == "" {
-		baseURL = roomBaseURL
+		baseURL = baseRoomURL
 	}
 	out := make([]*cupsAuth, 0, n)
 	delay := pause
 	if delay <= 0 {
 		delay = 150 * time.Millisecond
 	}
+	var lastErr error
 	for i := 0; i < n; i++ {
 		var a *cupsAuth
-		var lastErr error
 		for attempt := 0; attempt < 6; attempt++ {
-			a, lastErr = authorizeWithJar(baseURL, nil)
+			a, lastErr = authorize(ctx, baseURL, nil)
 			if lastErr == nil {
-				// The auto-create session (base URL, no ?room=) turns out to
-				// be a "creator" context that is NOT delivered editor pushes
-				// (verified live 2026-10: a creator connection subscribes and
-				// RPCs fine but never sees code_update; a ?room=<uuid> joiner
-				// session does). Re-authorize through our own join link and
-				// run the tunnel channels from that joiner identity; the
-				// creator session is left to drop (the room persists with
-				// joiners present — users_update confirms).
-				if a != nil && a.roomUUID != "" {
-					joiner, jerr := authorizeWithJar(baseURL+"?room="+a.roomUUID, nil)
-					if jerr == nil && joiner != nil && joiner.roomUUID == a.roomUUID {
-						a = joiner
-					} else if jerr != nil {
-						utils.Debugf("[CUPS] joiner re-auth (%s): %v", a.roomUUID, jerr)
-					}
-				}
 				break
 			}
 			msg := lastErr.Error()
@@ -348,7 +457,9 @@ func createRooms(baseURL string, n int, pause time.Duration) ([]*cupsAuth, error
 				wait = delay * time.Duration(attempt+1)
 			}
 			utils.Debugf("[CUPS] room %d attempt %d failed: %v (wait %v)", i+1, attempt+1, lastErr, wait)
-			<-time.After(wait)
+			if !sleepCtx(ctx, wait) {
+				return nil, fmt.Errorf("%w (%v)", errStopped, lastErr)
+			}
 		}
 		if a == nil {
 			utils.Debugf("[CUPS] room %d skipped: %v", i+1, lastErr)
@@ -356,67 +467,41 @@ func createRooms(baseURL string, n int, pause time.Duration) ([]*cupsAuth, error
 		}
 		out = append(out, a)
 		utils.Debugf("[CUPS] created room %d/%d: %s", i+1, n, a.roomUUID)
-		if i < n-1 {
-			<-time.After(delay)
+		if i < n-1 && !sleepCtx(ctx, delay) {
+			return nil, errStopped
 		}
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("could not create any room")
+		return nil, fmt.Errorf("could not create any room: %v", lastErr)
 	}
 	return out, nil
 }
 
-func packRooms(auths []*cupsAuth) string {
-	ids := make([]string, 0, len(auths))
-	for _, a := range auths {
-		ids = append(ids, a.roomUUID)
-	}
-	raw, _ := json.Marshal(ids)
-	return base64.RawURLEncoding.EncodeToString(raw)
-}
-
-func unpackRooms(s string) ([]string, error) {
-	raw, err := base64.RawURLEncoding.DecodeString(s)
-	if err != nil {
-		return nil, fmt.Errorf("base64 decode: %w", err)
-	}
-	var ids []string
-	if err := json.Unmarshal(raw, &ids); err != nil {
-		return nil, fmt.Errorf("json decode: %w", err)
-	}
-	return ids, nil
-}
-
 // CreateRoomList creates new rooms, as an exit started without a room list
-// does, and returns their packed list for --url. Upstream's provisioning API
-// (the phpbox "Своя нода" wizard); it rides createRooms above, so the rooms
-// are created with the same joiner re-auth the code-channel transport needs.
+// does, and returns their packed list for --url. The "Своя нода" wizard
+// creates them from the app so the node starts with the list in its config
+// and keeps the same rooms, and the same link, across restarts.
 func CreateRoomList(ctx context.Context) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
 	cfg := DefaultCupsonlineConfig()
-	auths, err := createRooms(roomBaseURL, cfg.NumRooms, cfg.RoomCreatePause)
+	auths, err := createRooms(ctx, baseRoomURL, cfg.NumRooms, cfg.RoomCreatePause)
 	if err != nil {
 		if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "429") {
 			return "", errors.New("cups.online отказывает этому адресу в новых комнатах (похоже на ограничение по частоте), попробуйте позже или выберите другой транспорт")
 		}
 		return "", err
 	}
-	if len(auths) == 0 {
-		return "", fmt.Errorf("cups.online не создал комнаты")
+	ids := make([]string, len(auths))
+	for i, a := range auths {
+		ids[i] = a.roomUUID
 	}
-	return packRooms(auths), nil
+	return transport.PackRooms(ids, stripeNewRooms()), nil
 }
 
 // CreateRoom creates one room and returns its uuid: what a phpbox exit, which
 // joins exactly one room, needs.
 func CreateRoom(ctx context.Context) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
 	cfg := DefaultCupsonlineConfig()
-	auths, err := createRooms(roomBaseURL, 1, cfg.RoomCreatePause)
+	auths, err := createRooms(ctx, baseRoomURL, 1, cfg.RoomCreatePause)
 	if err != nil {
 		if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "429") {
 			return "", errors.New("cups.online отказывает этому адресу в новых комнатах (похоже на ограничение по частоте), попробуйте позже или выберите другой транспорт")
@@ -427,6 +512,37 @@ func CreateRoom(ctx context.Context) (string, error) {
 		return "", errors.New("cups.online не создал комнату")
 	}
 	return auths[0].roomUUID, nil
+}
+
+// packRooms packs a list in the old, unstriped format.
+func packRooms(ids []string) string { return transport.PackRooms(ids, false) }
+
+func unpackRooms(s string) ([]string, error) {
+	ids, _, err := transport.UnpackRooms(s)
+	return ids, err
+}
+
+func envInt(name string) int {
+	n, _ := strconv.Atoi(os.Getenv(name))
+	return n
+}
+
+// stripeNewRooms: rooms an exit or the wizard creates now get the striped
+// list, unless CUPS_STRIPE=0 asks for the old wire (for peers older than
+// 0.7.1).
+func stripeNewRooms() bool { return os.Getenv("CUPS_STRIPE") != "0" }
+
+// sleepCtx waits for d, or less if ctx ends first; it reports whether the
+// whole wait went by.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // ---- per-channel stats ----
@@ -441,13 +557,30 @@ type channelStats struct {
 	batchesSent atomic.Uint64
 	batchesRecv atomic.Uint64
 	reconnects  atomic.Uint64
-	flows       atomic.Uint64
+	dropped     atomic.Uint64
+	rpcErrors   atomic.Uint64 // the server turned a message down
 }
 
 // ---- WS ----
 
 type cupsWS struct {
-	auth   *cupsAuth
+	idx      int
+	roomUUID string
+	joinedAt time.Time
+
+	// authPtr is swapped on every re-join (fresh tokens), so it's atomic. It
+	// stays nil until the room has been entered at least once.
+	authPtr atomic.Pointer[cupsAuth]
+	// session keeps the cookies between joins (run's goroutine only).
+	session *http.Client
+
+	// dead is set while the room looks closed; onRoomState reports the
+	// change so the operator can see when (and after how long) it happened.
+	dead        atomic.Bool
+	goneDelay   time.Duration // run's goroutine only
+	lastSend    time.Time     // sendLoop goroutine only; paces messages
+	onRoomState func()
+
 	config CupsonlineConfig
 	conn   *websocket.Conn
 
@@ -455,121 +588,41 @@ type cupsWS struct {
 	rpcID   atomic.Int64
 	onData  func([]byte)
 
-	// Code channel identity: exit owns "X" blocks, client owns "Y" blocks.
-	// roomIdx is only cosmetic (marker text); peer-block lookup matches the
-	// side tag with any index so both peers stay compatible even if their
-	// room lists drift apart.
-	side     string // "X" (exit) or "Y" (client)
-	peerSide string
-	roomIdx  int
-
-	// Code baseline, guarded by codeMu: the last known full room-code text
-	// plus its server version (-1 = never learned).
-	codeMu      sync.Mutex
-	serverCode  string
-	codeVersion int64
-
-	// connGen counts websockets installed by connectAndServe. A pipelined
-	// write carries the generation it was dispatched on; a reply or a
-	// baseline prediction from an older generation is stale the moment the
-	// number moves (the send loop re-derives everything from the fresh
-	// fetchBaselineInline document).
-	connGen atomic.Uint64
-
-	// RPC reply correlation: callRPC registers a reply channel under the
-	// frame id; the read loop routes {"id":N,...} frames here.
-	pendingMu sync.Mutex
-	pending   map[int64]chan rpcResp
-
-	// Peer-data dedupe (own edits echo back as code_update pushes). These
-	// fields are touched only from the read-loop goroutine (which includes
-	// the inline baseline fetch inside connectAndServe).
-	havePeerState bool
-	lastPeerHash  uint64
-	observedVer   int64
-
-	ctx       chan struct{}
-	closed    atomic.Bool
+	ctx       context.Context
 	connected atomic.Bool
 
+	// recvBufs reassemble each peer's byte stream across messages (one packet
+	// may be split over several), one buffer per room member: when two members
+	// send at once - two generations of a PHP exit handing over - a packet cut
+	// across messages must not take the other member's bytes into its middle.
+	// Touched only by the read goroutine, and reset on every reconnect - a
+	// packet split across a drop is lost, like on any link.
+	recvBufs map[string][]byte
+
 	sendQueue chan []byte
+
+	// pull, when set, makes this room a stripe lane: sendLoop takes pieces
+	// from the stripe instead of sendQueue (see pullLoop). wake says the
+	// stripe has something for it, or that an in-flight RPC was answered.
+	pull atomic.Pointer[func(max int) [][]byte]
+	wake chan struct{}
+	// inflight counts cursor RPCs sent on this socket and not yet answered;
+	// dataIDs are their command ids. The puller waits while inflight reaches
+	// the window (see pullLoop); a reply decrements it (see handleReply).
+	// Both are reset with the socket.
+	window   int
+	inflight atomic.Int64
+	dataIDs  sync.Map
+	// framed: on the striped wire every message carries whole packets only
+	// (see pullLoop), so it is read on its own, without a stream buffer.
+	framed bool
 
 	stats *channelStats
 }
 
-type rpcResp struct {
-	data json.RawMessage
-	err  error
-}
-
-var errWSReset = fmt.Errorf("websocket reconnected")
-
 func (w *cupsWS) nextID() int64 { return w.rpcID.Add(1) }
 
-// sendRPCAsync sends one Centrifugo RPC frame and returns IMMEDIATELY: the
-// reply (or, if the websocket dies first, the error clearPending manufactures
-// for every outstanding call) arrives on the returned channel. The caller owns
-// it; nothing here waits for the round trip.
-func (w *cupsWS) sendRPCAsync(method string, data map[string]interface{}) (int64, chan rpcResp, error) {
-	id := w.nextID()
-	ch := make(chan rpcResp, 1)
-	w.pendingMu.Lock()
-	if w.pending == nil {
-		w.pending = make(map[int64]chan rpcResp)
-	}
-	w.pending[id] = ch
-	w.pendingMu.Unlock()
-
-	msg := map[string]interface{}{
-		"rpc": map[string]interface{}{"method": method, "data": data},
-		"id":  id,
-	}
-	if err := w.writeJSON(msg); err != nil {
-		w.pendingMu.Lock()
-		delete(w.pending, id)
-		w.pendingMu.Unlock()
-		return 0, nil, err
-	}
-	return id, ch, nil
-}
-
-// callRPC sends one Centrifugo RPC frame and waits for the reply correlated by
-// frame id. Replies arrive through the read loop (handleMessage → pending).
-func (w *cupsWS) callRPC(method string, data map[string]interface{}, timeout time.Duration) (json.RawMessage, error) {
-	id, ch, err := w.sendRPCAsync(method, data)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		w.pendingMu.Lock()
-		delete(w.pending, id)
-		w.pendingMu.Unlock()
-	}()
-
-	select {
-	case r := <-ch:
-		return r.data, r.err
-	case <-w.ctx:
-		return nil, fmt.Errorf("closed")
-	case <-time.After(timeout):
-		return nil, fmt.Errorf("rpc %s timeout (id %d)", method, id)
-	}
-}
-
-// clearPending fails every in-flight RPC call (connection reset); called when
-// the active websocket goes away or a fresh one is installed, so senders never
-// wait out the timeout on a reply that can no longer arrive.
-func (w *cupsWS) clearPending(reason error) {
-	w.pendingMu.Lock()
-	for id, ch := range w.pending {
-		select {
-		case ch <- rpcResp{err: reason}:
-		default:
-		}
-		delete(w.pending, id)
-	}
-	w.pendingMu.Unlock()
-}
+func (w *cupsWS) auth() *cupsAuth { return w.authPtr.Load() }
 
 func (w *cupsWS) writeRaw(data []byte) error {
 	w.writeMu.Lock()
@@ -577,7 +630,15 @@ func (w *cupsWS) writeRaw(data []byte) error {
 	if w.conn == nil {
 		return fmt.Errorf("ws not connected")
 	}
-	return w.conn.WriteMessage(websocket.TextMessage, data)
+	w.conn.SetWriteDeadline(time.Now().Add(w.config.WSWriteTimeout))
+	if err := w.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		// A failed or timed-out write leaves the socket unusable. Closing it
+		// makes the reader notice and reconnect instead of sitting on a dead
+		// channel until the read timeout.
+		w.conn.Close()
+		return err
+	}
+	return nil
 }
 
 func (w *cupsWS) writeJSON(v interface{}) error {
@@ -595,111 +656,187 @@ func (w *cupsWS) currentConn() *websocket.Conn {
 	return w.conn
 }
 
+// roomDeadAfterFails is how many joins in a row may fail to reach a
+// subscribed channel (with fresh tokens each time) before the room is
+// reported closed even though its page still loads.
+const roomDeadAfterFails = 5
+
 func (w *cupsWS) run() {
 	delay := w.config.ReconnectMinDelay
-	for {
-		select {
-		case <-w.ctx:
-			return
-		default:
+	fails := 0
+	// Start hands over freshly joined rooms; one it couldn't enter has no
+	// tokens yet and has to be joined first.
+	needJoin := w.auth() == nil
+	for w.ctx.Err() == nil {
+		if needJoin || w.dead.Load() {
+			if err := w.join(); err != nil {
+				if !sleepCtx(w.ctx, w.retryDelay(delay)) {
+					return
+				}
+				delay = w.backoff(delay)
+				continue
+			}
+			needJoin = false
 		}
-		if err := w.connectAndServe(); err != nil {
-			utils.Debugf("[CUPS] ws error (%s): %v", w.auth.roomUUID, err)
-		}
-		w.connected.Store(false)
-		if w.closed.Load() {
+
+		err := w.connectAndServe()
+		wasReady := w.connected.Swap(false)
+		if w.ctx.Err() != nil {
 			return
+		}
+		utils.Debugf("[CUPS] ws error (%s): %v", w.roomUUID, err)
+		if wasReady {
+			delay = w.config.ReconnectMinDelay
+			fails = 0
+		} else if fails++; fails == roomDeadAfterFails {
+			w.markDead(fmt.Errorf("канал не поднимается %d раз подряд: %v", fails, err))
 		}
 		w.stats.reconnects.Add(1)
-		select {
-		case <-time.After(delay):
-		case <-w.ctx:
+		// Tokens come from the room page once per join and can expire, so
+		// reconnecting with the old ones may never work again. Re-join when
+		// Centrifugo turned them down, and every other failed attempt in case
+		// it said so just by hanging up. A connection that was working and
+		// dropped just reconnects: a join is two page loads, and a reconnect
+		// storm of those is how an IP gets rate-limited.
+		needJoin = errors.Is(err, errRefused) || (!wasReady && fails%2 == 0)
+		if !sleepCtx(w.ctx, w.retryDelay(delay)) {
 			return
 		}
-		delay = time.Duration(float64(delay) * w.config.ReconnectMultiplier)
-		if delay > w.config.ReconnectMaxDelay {
-			delay = w.config.ReconnectMaxDelay
+		delay = w.backoff(delay)
+	}
+}
+
+// retryDelay is the wait before the next attempt: the usual backoff, or the
+// much slower probe interval while the room looks closed.
+func (w *cupsWS) retryDelay(delay time.Duration) time.Duration {
+	if !w.dead.Load() {
+		return delay
+	}
+	d := w.goneDelay
+	w.goneDelay = min(2*d, w.config.RoomGoneRetryMax)
+	return d
+}
+
+func (w *cupsWS) backoff(delay time.Duration) time.Duration {
+	return min(time.Duration(float64(delay)*w.config.ReconnectMultiplier), w.config.ReconnectMaxDelay)
+}
+
+// join enters the room for fresh tokens, in the same session as before. This
+// is also where a closed room shows itself.
+func (w *cupsWS) join() error {
+	a, err := joinRoom(w.ctx, w.roomUUID, w.session)
+	if err != nil {
+		// Next time from a clean session, in case this one is what's broken.
+		w.session = nil
+		if errors.Is(err, errRoomGone) {
+			w.markDead(err)
+		} else if w.ctx.Err() == nil {
+			utils.Debugf("[CUPS] join %s failed: %v", w.roomUUID, err)
 		}
+		return err
+	}
+	w.session = a.httpClient
+	w.authPtr.Store(a)
+	return nil
+}
+
+func (w *cupsWS) markDead(err error) {
+	if w.dead.Swap(true) {
+		return
+	}
+	utils.Infof("[ERROR] Cups: комната %s закрылась (в работе %s): %v",
+		shortRoom(w.roomUUID), fmtUptime(time.Since(w.joinedAt)), err)
+	if w.onRoomState != nil {
+		w.onRoomState()
+	}
+}
+
+func (w *cupsWS) markAlive() {
+	w.goneDelay = w.config.RoomGoneRetryMin
+	if !w.dead.Swap(false) {
+		return
+	}
+	utils.Infof("[CUPS] Cups: комната %s снова доступна", shortRoom(w.roomUUID))
+	if w.onRoomState != nil {
+		w.onRoomState()
 	}
 }
 
 func (w *cupsWS) connectAndServe() error {
-	wsURL := strings.Replace(w.auth.connURL, "https://", "wss://", 1)
+	a := w.auth()
+	wsURL := strings.Replace(a.connURL, "https://", "wss://", 1)
 	wsURL = strings.Replace(wsURL, "http://", "ws://", 1)
 	wsURL = strings.TrimRight(wsURL, "/") + "/websocket"
 
 	header := http.Header{}
-	header.Set("Origin", originOf(w.auth.connURL))
+	header.Set("Origin", originOf(a.connURL))
 	header.Set("User-Agent", cupsUA)
-	for _, c := range w.auth.httpClient.Jar.Cookies(mustParseURL(w.auth.connURL)) {
+	for _, c := range a.httpClient.Jar.Cookies(mustParseURL(a.connURL)) {
 		header.Add("Cookie", c.Name+"="+c.Value)
 	}
 
+	dial := netbind.DialContext
+	if w.framed {
+		dial = dialLane
+	}
 	dialer := websocket.Dialer{
+		NetDialContext:   dial,
 		HandshakeTimeout: w.config.WSHandshakeTimeout,
 		ReadBufferSize:   w.config.ReadBufferSize,
 		WriteBufferSize:  w.config.WriteBufferSize,
 	}
-	conn, _, err := dialer.Dial(wsURL, header)
+	conn, _, err := dialer.DialContext(w.ctx, wsURL, header)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
-	w.clearPending(errWSReset)
+	// Stop mustn't have to wait for the server's next message to take the
+	// reader down.
+	unhook := context.AfterFunc(w.ctx, func() { conn.Close() })
+	defer unhook()
 	w.writeMu.Lock()
 	w.conn = conn
 	w.writeMu.Unlock()
 	defer func() {
-		w.clearPending(errWSReset)
 		w.writeMu.Lock()
 		w.conn = nil
 		w.writeMu.Unlock()
 		conn.Close()
 	}()
 
-	conn.SetReadLimit(int64(w.config.ReadBufferSize))
+	conn.SetReadLimit(int64(w.config.MaxMessageBytes))
+	// Fresh socket, fresh stream: drop any half-assembled packet from before.
+	w.recvBufs = nil
+	// The replies to RPCs sent on the old socket will never come; start the
+	// in-flight count and its ids clean so the puller isn't stuck at the
+	// window forever.
+	w.inflight.Store(0)
+	w.dataIDs.Range(func(k, _ any) bool { w.dataIDs.Delete(k); return true })
 
 	if err := w.writeJSON(map[string]interface{}{
-		"id": 1, "connect": map[string]interface{}{"token": w.auth.connToken, "name": "js"},
+		"id": 1, "connect": map[string]interface{}{"token": a.connToken, "name": "js"},
 	}); err != nil {
 		return err
 	}
-	conn.SetReadDeadline(time.Now().Add(w.config.WSReadTimeout))
-	if _, _, err := conn.ReadMessage(); err != nil {
+	if err := readReply(conn, w.config.WSHandshakeTimeout, 1, "connect", w.handleReply); err != nil {
 		return err
 	}
 	if err := w.writeJSON(map[string]interface{}{
-		"id": 2, "subscribe": map[string]interface{}{"channel": w.auth.channel, "token": w.auth.subToken},
+		"id": 2, "subscribe": map[string]interface{}{"channel": a.channel, "token": a.subToken},
 	}); err != nil {
 		return err
 	}
-	conn.SetReadDeadline(time.Now().Add(w.config.WSReadTimeout))
-	if _, _, err := conn.ReadMessage(); err != nil {
+	if err := readReply(conn, w.config.WSHandshakeTimeout, 2, "subscribe", w.handleReply); err != nil {
 		return err
 	}
-
-	// The data channel is diff-based: every change_code must apply against the
-	// exact current room document, so fetch the baseline (code + version) the
-	// way the real browser client does on "subscribed" before serving sends.
-	if err := w.fetchBaselineInline(conn); err != nil {
-		return err
-	}
-	// Publish the generation BEFORE connected: a pipelined write may only be
-	// dispatched while connected is true, and it then tags the current
-	// generation, so a write can never outlive the baseline it was built on.
-	w.connGen.Add(1)
 	w.connected.Store(true)
-	utils.Debugf("[CUPS] WS ready: %s", w.auth.roomUUID)
+	w.markAlive()
+	utils.Debugf("[CUPS] WS ready: %s", a.roomUUID)
 
 	kaStop := make(chan struct{})
 	go w.keepAliveLoop(kaStop)
 	defer close(kaStop)
 
 	for {
-		select {
-		case <-w.ctx:
-			return nil
-		default:
-		}
 		conn.SetReadDeadline(time.Now().Add(w.config.WSReadTimeout))
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
@@ -716,13 +853,13 @@ func (w *cupsWS) keepAliveLoop(stop chan struct{}) {
 		select {
 		case <-stop:
 			return
-		case <-w.ctx:
+		case <-w.ctx.Done():
 			return
 		case <-t.C:
 			_ = w.writeJSON(map[string]interface{}{
 				"rpc": map[string]interface{}{
 					"method": "shared_editor_ping",
-					"data":   map[string]interface{}{"room": w.auth.roomUUID, "user": w.auth.userUUID},
+					"data":   map[string]interface{}{"room": w.auth().roomUUID, "user": w.auth().userUUID},
 				},
 				"id": w.nextID(),
 			})
@@ -730,813 +867,461 @@ func (w *cupsWS) keepAliveLoop(stop chan struct{}) {
 	}
 }
 
-// pendingWrite is one change_code write queued for, or on, the pipelined
-// wire: a payload batch, or a stray-block prune riding ahead of one. The
-// send-loop goroutine owns everything about it except the fields the
-// completion handler reads after the reply arrives.
-type pendingWrite struct {
-	id        int64    // rpc frame id of the CURRENT wire attempt
-	seq       uint64   // position in the ordered dispatch queue
-	batch     [][]byte // payload; nil for prune writes
-	rawBytes  int      // payload bytes (stats)
-	predicted string   // full document the server must hold once this write lands
-	base      string   // document the diff was computed against
-	baseVer   int64
-	attempts  int // wire attempts made (0 = never dispatched)
-	gen       uint64
-	prune     bool
-}
-
-type sendCompletion struct {
-	id int64
-	r  rpcResp
-}
-
-// sendLoop batches the send queue and drives the pipelined writer: up to
-// MaxInflightBatches change_code calls are outstanding at a time, each next
-// batch is built optimistically on the predicted document of the writes still
-// in flight, and replies are processed asynchronously — out of order, adopted
-// only by version monotonicity (adoptServerCode refuses anything older than
-// the applied baseline). A write the server did not apply (silent no-op,
-// rejected, lost connection) gets exactly ONE rebase+retransmit through the
-// ordered dispatch queue while the rest of the window proceeds; if even that
-// comes back unapplied, the batch falls to the old blocking sendBatch ladder
-// (with its room_info refresh) as a last resort. Only the WIRE is pipelined:
-// the dispatch queue keeps writes in batch order, and when the window is full
-// the loop stops draining sendQueue, so upstream backpressure is exactly what
-// the serial writer had.
-//
-// The small-packet fast path is the BatchIdleFlush arm of the batch timer: an
-// isolated frame over a drained queue flushes after the idle wait (12 ms)
-// instead of the full dwell — verified by TestIsolatedSendFlushesPromptly and
-// TestPipelinedLatencyNoBacklog. Prioritising small frames ahead of queued
-// bulk bytes would need per-frame classes the wire format does not carry;
-// under bulk load the 30 ms dwell already bounds the wait.
 func (w *cupsWS) sendLoop() {
-	window := w.config.MaxInflightBatches
-	if window < 1 {
-		window = 1
+	if src := w.pull.Load(); src != nil {
+		w.pullLoop(*src)
+		return
 	}
-
 	batch := make([][]byte, 0, w.config.BatchMaxPackets)
 	totalBytes := 0
-	var firstAt time.Time // when the batch's first frame arrived (zero = empty batch)
-	timer := time.NewTimer(time.Hour)
-	if !timer.Stop() {
-		<-timer.C
-	}
+	timer := time.NewTimer(w.config.BatchTimeout)
+	timer.Stop()
 	defer timer.Stop()
 
-	// Effective per-batch byte gate: the code document can only take so much.
-	maxBytes := w.config.BatchMaxBytes
-	if w.config.MaxCodeBytesPerBatch > 0 && (maxBytes <= 0 || w.config.MaxCodeBytesPerBatch < maxBytes) {
-		maxBytes = w.config.MaxCodeBytesPerBatch
-	}
-	idle := w.config.BatchIdleFlush
-	if idle < 0 {
-		idle = 0
-	}
-
-	// arm schedules the next flush: never later than the dwell deadline from
-	// the batch's first frame, earlier (idle) once the send queue has drained
-	// so interactive traffic does not pay the dwell.
-	arm := func() {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		wait := time.Until(firstAt.Add(w.config.BatchTimeout))
-		if len(w.sendQueue) == 0 && idle < wait {
-			wait = idle
-		}
-		if wait < 0 {
-			wait = 0
-		}
-		timer.Reset(wait)
-	}
-
-	// ---- pipelined writer state, owned by THIS goroutine ----
-	var seqCounter uint64
-	nextSeq := func() uint64 { seqCounter++; return seqCounter }
-
-	inflight := make(map[int64]*pendingWrite, window+2)
-	var dispatchQ []*pendingWrite // formed writes awaiting the wire, ordered by seq
-	overlayTip := ""              // predicted doc after ALL dispatched writes ("" = no chain)
-	var tipGen uint64             // connGen overlayTip was built on
-	completions := make(chan sendCompletion, 2*window+8)
-	retry := time.NewTicker(20 * time.Millisecond) // re-check dispatch when a write cannot go out yet
-	defer retry.Stop()
-
-	// startWrite puts one write on the wire and arranges for its reply to
-	// land on completions. The send loop never waits for it here; the reply
-	// is bounded by the same changeRPCTimeout the serial ladder gave every
-	// call, so a hung server worker cannot pin a window slot forever.
-	startWrite := func(pw *pendingWrite, diff string) bool {
-		id, ch, err := w.sendRPCAsync("shared_editor_change_code", map[string]interface{}{
-			"diff": diff,
-			"room": w.auth.roomUUID,
-			"user": w.auth.userUUID,
-		})
-		if err != nil {
-			utils.Debugf("[CUPS] change_code dispatch (%s): %v", w.auth.roomUUID, err)
-			return false
-		}
-		pw.id = id
-		pw.attempts++
-		inflight[id] = pw
-		go func() {
-			select {
-			case r := <-ch:
-				select {
-				case completions <- sendCompletion{id: id, r: r}:
-				case <-w.ctx:
-				}
-			case <-time.After(changeRPCTimeout):
-				w.pendingMu.Lock()
-				delete(w.pending, id)
-				w.pendingMu.Unlock()
-				select {
-				case completions <- sendCompletion{id: id, r: rpcResp{err: fmt.Errorf("rpc change_code timeout (id %d)", id)}}:
-				case <-w.ctx:
-				}
-			case <-w.ctx:
-			}
-		}()
-		return true
-	}
-
-	// insertBySeq re-enters a failed write at its ordering position, so a
-	// retransmit of batch k is always dispatched before batch k+1's fresh
-	// write (the queue stays ordered; only the wire pipelines).
-	insertBySeq := func(pw *pendingWrite) {
-		i := len(dispatchQ)
-		for i > 0 && dispatchQ[i-1].seq > pw.seq {
-			i--
-		}
-		dispatchQ = append(dispatchQ, nil)
-		copy(dispatchQ[i+1:], dispatchQ[i:])
-		dispatchQ[i] = pw
-	}
-
-	confirmWrite := func(pw *pendingWrite) {
-		if pw.batch != nil {
-			w.countSent(len(pw.batch), pw.rawBytes, pw.predicted)
-		}
-	}
-
-	// failWrite handles a write that did not come back applied. The
-	// optimistic chain dies with the broken expectation (the next dispatch
-	// rebases on the authoritative baseline); the payload gets its ONE
-	// async rebase+retransmit — re-derived against whatever the baseline is
-	// AT DISPATCH TIME, so several failures in flight rebase independently
-	// and converge in queue order. After that the old serial ladder owns
-	// the batch, retries and final drop included.
-	failWrite := func(pw *pendingWrite) {
-		overlayTip = ""
-		if pw.prune {
-			// Housekeeping write: strays are re-detected at the next payload
-			// dispatch (at most one prune per payload write, exactly as the
-			// serial ladder budgeted), so a lost prune needs no requeue.
-			return
-		}
-		if pw.attempts < 2 {
-			insertBySeq(pw) // the ONE rebase+retransmit
-			return
-		}
-		if err := w.sendBatch(pw.batch); err != nil {
-			utils.Debugf("[CUPS] legacy resend after pipeline (%s): %v", w.auth.roomUUID, err)
-		}
-	}
-
-	handleCompletion := func(c sendCompletion) {
-		pw, ok := inflight[c.id]
-		if !ok {
-			return
-		}
-		delete(inflight, c.id)
-
-		if pw.gen != w.connGen.Load() {
-			// The websocket was replaced under this write (clearPending
-			// manufactured the error): the attempt was not spent and there is
-			// nothing authoritative to adopt — requeue for the fresh baseline.
-			if pw.attempts > 0 {
-				pw.attempts--
-			}
-			failWrite(pw)
-			return
-		}
-		if c.r.err != nil {
-			utils.Debugf("[CUPS] change_code (%s) rejected: %v", w.auth.roomUUID, c.r.err)
-			failWrite(pw)
-			return
-		}
-		code, ver, haveCode, haveVer := parseCodeResp(c.r.data)
-		if haveCode {
-			// The reply's code is the authoritative document for this
-			// channel. Replies may arrive out of order: adoption is version
-			// monotonic, an older reply can never roll the baseline back.
-			w.adoptServerCode(code, ver, haveVer)
-			if code == pw.predicted {
-				confirmWrite(pw)
-				return
-			}
-			// Silent no-op / fuzzy apply: our patch did not land as predicted.
-			utils.Debugf("[CUPS] change_code (%s) not applied: server doc %d bytes, predicted %d",
-				w.auth.roomUUID, len(code), len(pw.predicted))
-			failWrite(pw)
-			return
-		}
-		// No code in the reply: the old optimistic (guarded) promotion.
-		w.applyChangeSuccess(pw.base, pw.predicted, c.r.data)
-		confirmWrite(pw)
-	}
-
-	// dispatchHead puts queued writes on the wire while the window has room,
-	// strictly in queue order. Payload diffs are built at DISPATCH time, on
-	// the freshest baseline or the optimistic tip — so a retransmit is always
-	// rebased on what the server is known to hold right then.
-	dispatchHead := func() {
-		for len(dispatchQ) > 0 && len(inflight) < window && w.connected.Load() {
-			pw := dispatchQ[0]
-			gen := w.connGen.Load()
-
-			w.codeMu.Lock()
-			base, baseVer := w.serverCode, w.codeVersion
-			w.codeMu.Unlock()
-			chained := false
-			if overlayTip != "" {
-				if tipGen == gen {
-					base = overlayTip
-					chained = true
-				} else {
-					overlayTip = ""
-				}
-			}
-
-			if !chained {
-				// Bounded housekeeping ahead of the payload (at most one
-				// prune per payload write): stray copies of our block from an
-				// earlier fuzzy apply are dead document weight this frame's
-				// data-region edit can never reach. The prune rides as its own
-				// pipelined write and the payload chains onto its prediction;
-				// if the prune write is itself lost, the next dispatch
-				// re-detects the strays.
-				if pDoc, pDiff, ok := buildStrayPrune(base, w.side); ok {
-					pr := &pendingWrite{seq: nextSeq(), prune: true, predicted: pDoc, base: base, baseVer: baseVer, gen: gen}
-					if startWrite(pr, pDiff) {
-						overlayTip = pDoc
-						tipGen = gen
-						continue // rebuild the payload against the pruned prediction
-					}
-				}
-			}
-
-			col, rawTotal := framePackets(pw.batch)
-			colB64 := base64.RawStdEncoding.EncodeToString(col)
-			newCode, diff, changed := buildBlockEdit(base, w.side, w.roomIdx, colB64)
-			if !changed {
-				// The baseline we are building on already carries exactly this
-				// payload in our block. Building on the confirmed baseline it
-				// means the bytes are on the server (and were pushed: the peer
-				// dedupes identical peer blocks, so even a real RPC could not
-				// deliver them again); building on the tip means an in-flight
-				// write already carries them. Either way, account and drop.
-				dispatchQ = dispatchQ[1:]
-				w.countSent(len(pw.batch), rawTotal, base)
-				continue
-			}
-			pw.base, pw.baseVer = base, baseVer
-			pw.predicted = newCode
-			pw.rawBytes = rawTotal
-			pw.gen = gen
-			if !startWrite(pw, diff) {
-				break // the websocket went away under us; the retry tick retries
-			}
-			dispatchQ = dispatchQ[1:]
-			overlayTip = newCode
-			tipGen = gen
-		}
-	}
-
-	// wrap closes the forming batch into the ordered dispatch queue.
-	wrap := func() {
+	flush := func() {
+		timer.Stop()
 		if len(batch) == 0 {
 			return
 		}
-		dispatchQ = append(dispatchQ, &pendingWrite{seq: nextSeq(), batch: batch})
-		batch = make([][]byte, 0, w.config.BatchMaxPackets)
+		if !w.connected.Load() {
+			// The channel went down with this batch still here. New traffic
+			// has already moved to a room that's up, and by the time this one
+			// is back the batch is stale, so it's dropped rather than
+			// delivered late and out of order.
+			w.stats.dropped.Add(uint64(len(batch)))
+		} else if err := w.sendBatch(batch); err != nil {
+			w.stats.dropped.Add(uint64(len(batch)))
+			utils.Debugf("[CUPS] batch send (%s): %v", w.roomUUID, err)
+		}
+		clear(batch)
+		batch = batch[:0]
 		totalBytes = 0
-		firstAt = time.Time{}
 	}
 
 	for {
-		// Push everything ready: process arrived replies, then the wire.
-		for {
-			select {
-			case c := <-completions:
-				handleCompletion(c)
-				continue
-			default:
-			}
-			if len(dispatchQ) > 0 && len(inflight) < window && w.connected.Load() {
-				before := len(dispatchQ)
-				dispatchHead()
-				if len(dispatchQ) < before {
-					continue
-				}
-			}
-			break
-		}
-
-		// Window full or queued writes waiting: do not drain the send queue —
-		// Send() blocks upstream exactly as it did on the serial writer.
-		var drain chan []byte
-		if len(dispatchQ) == 0 && len(inflight) < window {
-			drain = w.sendQueue
-		}
-		var retryC <-chan time.Time
-		if len(dispatchQ) > 0 {
-			retryC = retry.C
-		}
-
 		select {
-		case <-w.ctx:
-			// Best effort, like the old final flush: put whatever is queued
-			// on the wire (the server commits what arrives even if our side
-			// is already closing) and go.
-			wrap()
-			if w.connected.Load() {
-				dispatchHead()
-			}
+		case <-w.ctx.Done():
 			return
-		case pkt := <-drain:
-			if len(batch) == 0 {
-				firstAt = time.Now()
+		case pkt := <-w.sendQueue:
+			// Flush before a packet that would overflow the batch, not after
+			// it: otherwise a batch ends up a whole packet over the limit.
+			if len(batch) > 0 && totalBytes+2+len(pkt) > w.config.BatchMaxBytes {
+				flush()
 			}
 			batch = append(batch, pkt)
-			totalBytes += len(pkt)
-			if len(batch) >= w.config.BatchMaxPackets || totalBytes >= maxBytes {
-				// Byte/packet cap reached: flush now, do not dwell.
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				wrap()
-			} else {
-				arm()
+			totalBytes += 2 + len(pkt)
+			if len(batch) >= w.config.BatchMaxPackets || totalBytes >= w.config.BatchMaxBytes {
+				flush()
+			} else if len(batch) == 1 {
+				timer.Reset(w.config.BatchTimeout)
 			}
 		case <-timer.C:
-			wrap()
-		case c := <-completions:
-			handleCompletion(c)
-		case <-retryC:
+			flush()
 		}
 	}
 }
 
-// sendBatch is the legacy serial ladder, now the LAST resort behind the
-// pipelined writer: a batch whose original send and its single async
-// rebase+retransmit both came back unapplied runs this full loop — refetch
-// room_info when nothing has tracked the document forward, recompute, retry
-// (bounded), then drop + error like before. It smuggles the batch into the
-// room's shared code document: our block (at the document tail) is replaced
-// with the base64 of the length-prefixed batch framing, and the resulting
-// character-offset patch (makeDiff) is sent via the shared_editor_change_code
-// RPC. The server applies the patch only if its chunks match verbatim at the
-// rune offsets — a stale baseline does NOT error: it silently no-ops and
-// bumps the version — so the accepted reply's authoritative "code" (the full
-// new document, observed live) is compared against our expectation. Packets
-// are never fragmented across calls — one batch either lands whole or is
-// retried/dropped, so the peer never sees a torn framing stream.
 func (w *cupsWS) sendBatch(batch [][]byte) error {
-	payload, totalRaw := framePackets(batch)
-	col := base64.RawStdEncoding.EncodeToString(payload)
+	var buf bytes.Buffer
+	var hdr [2]byte
+	totalRaw := 0
+	for _, p := range batch {
+		binary.BigEndian.PutUint16(hdr[:], uint16(len(p)))
+		buf.Write(hdr[:])
+		buf.Write(p)
+		totalRaw += len(p)
+	}
+	blob := buf.Bytes()
 
-	var lastErr error
-	for attempt := 1; attempt <= maxChangeCodeAttempts; attempt++ {
-		select {
-		case <-w.ctx:
-			return fmt.Errorf("closed")
-		default:
+	// One message can only carry so much before the server drops it, so a
+	// batch is cut into chunks and each goes as its own message. The far side
+	// stitches them back together in order.
+	for off := 0; off < len(blob); off += w.config.MaxMessageData {
+		end := min(off+w.config.MaxMessageData, len(blob))
+		if err := w.pace(); err != nil {
+			return err
 		}
+		if err := w.sendChunk(blob[off:end]); err != nil {
+			return err
+		}
+	}
+	w.stats.packetsSent.Add(uint64(len(batch)))
+	w.stats.bytesSent.Add(uint64(totalRaw))
+	w.stats.batchesSent.Add(1)
+	return nil
+}
 
-		w.codeMu.Lock()
-		base := w.serverCode
-		baseVer := w.codeVersion
-		w.codeMu.Unlock()
-
-		// Bounded housekeeping first (at most one prune per attempt): stray
-		// copies of our block from a fuzzy apply are dead document weight the
-		// payload edit can never reach; delete one, re-read the (authoritative)
-		// baseline, then write the payload into the survivor.
-		if pruneDoc, pruneDiff, ok := buildStrayPrune(base, w.side); ok {
-			if err := w.applyOneShot(pruneDiff, pruneDoc); err != nil {
-				utils.Debugf("[CUPS] stray prune (%s) attempt %d: %v", w.auth.roomUUID[:8], attempt, err)
+// pullLoop is sendLoop for a stripe lane. Right before each message may leave
+// (SendInterval after the last one) it takes from the stripe as many pieces
+// as fit in one message, so what the room cannot carry yet waits in the
+// stripe's queue, where CoDel sees it, and a piece's send time is when it
+// really leaves - the stripe's loss detection and round trip go by it.
+//
+// Every message carries whole pieces only ([len u16][piece]...): the server
+// may turn a message down or lose it when a room sends near its limit, and a
+// piece cut across two messages would then throw the far side's reading of
+// the rest of the stream out of step. This way a lost message costs exactly
+// its pieces, which the stripe resends. A piece is at most one message
+// (stripePieceBytes), so the one that does not fit opens the next message.
+func (w *cupsWS) pullLoop(src func(max int) [][]byte) {
+	var hdr [2]byte
+	var next []byte // a pulled piece that did not fit the last message
+	buf := make([]byte, 0, w.config.MaxMessageData)
+	idle := time.NewTimer(time.Hour)
+	defer idle.Stop()
+	add := func(p []byte) bool {
+		if len(buf)+2+len(p) > w.config.MaxMessageData {
+			return false
+		}
+		binary.BigEndian.PutUint16(hdr[:], uint16(len(p)))
+		buf = append(buf, hdr[:]...)
+		buf = append(buf, p...)
+		w.stats.packetsSent.Add(1)
+		w.stats.bytesSent.Add(uint64(len(p)))
+		return true
+	}
+	for w.ctx.Err() == nil {
+		if !w.connected.Load() {
+			if !sleepCtx(w.ctx, 50*time.Millisecond) {
+				return
 			}
-			w.codeMu.Lock()
-			base, baseVer = w.serverCode, w.codeVersion
-			w.codeMu.Unlock()
-		}
-
-		newCode, diff, changed := buildBlockEdit(base, w.side, w.roomIdx, col)
-		if !changed {
-			// The authoritative baseline already carries exactly this payload
-			// in our block — normally because a concurrent-write retry found
-			// our own patch had ALREADY landed (a fuzzy apply). The batch's
-			// bytes are on the server and its push went out, so account for
-			// the send; a fresh RPC would only bump the version.
-			utils.Debugf("[CUPS] change_code (%s): payload already in block, RPC skipped", w.auth.roomUUID)
-			w.countSent(len(batch), totalRaw, base)
-			return nil
-		}
-
-		data := map[string]interface{}{
-			"diff": diff,
-			"room": w.auth.roomUUID,
-			"user": w.auth.userUUID,
-		}
-		resp, err := w.callRPC("shared_editor_change_code", data, changeRPCTimeout)
-		if err == nil {
-			utils.Debugf("[CUPS] change_code ok (%s): diff=%dB code=%dB batch=%dpkts", w.auth.roomUUID[:8], len(diff), len(newCode), len(batch))
-			code, ver, haveCode, haveVer := parseCodeResp(resp)
-			if haveCode {
-				// The reply's code is the authoritative document.
-				w.adoptServerCode(code, ver, haveVer)
-				if code == newCode {
-					w.countSent(len(batch), totalRaw, newCode)
-					return nil
-				}
-				// Silent no-op / fuzzy apply: our patch did not land.
-				lastErr = fmt.Errorf("server document (%d bytes) != expected result (%d bytes)", len(code), len(newCode))
-				utils.Debugf("[CUPS] change_code (%s) attempt %d/%d not applied: %v", w.auth.roomUUID, attempt, maxChangeCodeAttempts, lastErr)
-			} else {
-				// No code in the reply: optimistic (guarded) promotion.
-				w.applyChangeSuccess(base, newCode, resp)
-				w.countSent(len(batch), totalRaw, newCode)
-				return nil
-			}
-		} else {
-			lastErr = err
-			utils.Debugf("[CUPS] change_code (%s) attempt %d/%d rejected: %v", w.auth.roomUUID, attempt, maxChangeCodeAttempts, err)
-		}
-		// Cheap rebase before reaching for the RPC: the change_code reply's
-		// own authoritative code (adopted above) or a code_update push that
-		// arrived since our snapshot already carries a newer baseline —
-		// retry against that. shared_editor_room_info only runs when nothing
-		// has tracked the document forward (e.g. a server-side edit that
-		// never broadcast, the live case TestStaleBaselineRecovery models).
-		if fresh, ok := w.rebasedBaseline(base, baseVer); ok {
-			utils.Debugf("[CUPS] change_code (%s) attempt %d/%d rebased on the tracked push/reply (%d bytes, no RPC)", w.auth.roomUUID, attempt, maxChangeCodeAttempts, len(fresh))
 			continue
 		}
-		if rerr := w.refreshBaseline(); rerr != nil {
-			utils.Debugf("[CUPS] baseline refresh (%s): %v", w.auth.roomUUID, rerr)
+		// Ack gate: wait while this room already has its window of RPCs
+		// unanswered, so a slow room (or uplink) holds the data in the
+		// stripe's queue instead of flooding the server with messages it
+		// drops from the relay. A reply (or the stripe) sends to wake.
+		for w.window > 0 && w.inflight.Load() >= int64(w.window) && w.connected.Load() {
+			idle.Reset(lanePollIdle)
+			select {
+			case <-w.ctx.Done():
+				return
+			case <-w.wake:
+			case <-idle.C:
+			}
+			idle.Stop()
+		}
+		if !w.connected.Load() {
+			continue
+		}
+		if d := w.config.SendInterval - time.Since(w.lastSend); d > 0 {
+			if !sleepCtx(w.ctx, d) {
+				return
+			}
+		}
+		buf = buf[:0]
+		if next != nil && add(next) {
+			next = nil
+		}
+		for next == nil {
+			pieces := src(1)
+			if len(pieces) == 0 {
+				break
+			}
+			for _, p := range pieces {
+				if next != nil || !add(p) {
+					next = p
+				}
+			}
+		}
+		if len(buf) == 0 {
+			if next != nil {
+				// Bigger than a message: the stripe never cuts one so big.
+				w.stats.dropped.Add(1)
+				next = nil
+				continue
+			}
+			idle.Reset(lanePollIdle)
+			select {
+			case <-w.ctx.Done():
+				return
+			case <-w.wake:
+			case <-idle.C:
+			}
+			idle.Stop()
+			continue
+		}
+		w.lastSend = time.Now()
+		id := w.nextID()
+		w.dataIDs.Store(id, struct{}{})
+		w.inflight.Add(1)
+		if err := w.sendChunkID(buf, id); err != nil {
+			w.dataIDs.Delete(id)
+			w.inflight.Add(-1)
+			w.stats.dropped.Add(1)
+			utils.Debugf("[CUPS] lane send (%s): %v", w.roomUUID, err)
+			continue
+		}
+		w.stats.batchesSent.Add(1)
+	}
+}
+
+// laneSendBuffer caps the kernel's send buffer on a stripe lane's socket, to
+// about two messages (a full one is ~25 KB of cursor JSON). The server takes
+// a room's messages only so fast; with the default buffer hundreds of KB sat
+// in the socket, the stripe saw round trips of seconds, resent on timeout
+// what was only queued, and the resends queued too. Small, the write blocks
+// instead, the lane's clock slows to what the server takes, and the backlog
+// stays in the stripe's queue where CoDel manages it.
+const laneSendBuffer = 64 << 10
+
+func dialLane(ctx context.Context, network, addr string) (net.Conn, error) {
+	c, err := netbind.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetWriteBuffer(laneSendBuffer)
+	}
+	return c, nil
+}
+
+// lanePollIdle is how long an idle stripe lane sleeps before it asks the
+// stripe again without being woken (acks and resends wake it too).
+const lanePollIdle = 50 * time.Millisecond
+
+// pace waits out the rest of SendInterval since the last message, so the
+// channel never floods the server. Returns errStopped if the transport is
+// stopped while waiting.
+func (w *cupsWS) pace() error {
+	if w.config.SendInterval <= 0 {
+		return nil
+	}
+	if d := w.config.SendInterval - time.Since(w.lastSend); d > 0 {
+		if !sleepCtx(w.ctx, d) {
+			return errStopped
 		}
 	}
-	return fmt.Errorf("change_code failed after %d attempts: %w", maxChangeCodeAttempts, lastErr)
-}
-
-// rebasedBaseline reports a baseline that reached us WITHOUT an extra RPC:
-// a code_update push (or the rejected send's own authoritative reply, which
-// the caller already adopted) carried the document past the caller's
-// snapshot — either its version moved ahead, or (unversioned servers) its
-// content did.
-func (w *cupsWS) rebasedBaseline(base string, baseVer int64) (string, bool) {
-	w.codeMu.Lock()
-	defer w.codeMu.Unlock()
-	if w.serverCode != base && (baseVer < 0 || w.codeVersion > baseVer) {
-		return w.serverCode, true
-	}
-	return "", false
-}
-
-// applyOneShot issues one housekeeping change_code (a stray prune) and
-// verifies it against the authoritative document in the reply. It is
-// best-effort: on mismatch the adopted server document simply becomes the
-// baseline the caller re-reads; no retry loop here.
-func (w *cupsWS) applyOneShot(diff, expectDoc string) error {
-	data := map[string]interface{}{
-		"diff": diff,
-		"room": w.auth.roomUUID,
-		"user": w.auth.userUUID,
-	}
-	resp, err := w.callRPC("shared_editor_change_code", data, changeRPCTimeout)
-	if err != nil {
-		return err
-	}
-	code, ver, haveCode, haveVer := parseCodeResp(resp)
-	if !haveCode {
-		return fmt.Errorf("no code in prune reply")
-	}
-	w.adoptServerCode(code, ver, haveVer)
-	if code != expectDoc {
-		return fmt.Errorf("prune not applied: server %d bytes, expected %d", len(code), len(expectDoc))
-	}
+	w.lastSend = time.Now()
 	return nil
 }
 
-func (w *cupsWS) countSent(packets, rawBytes int, newCode string) {
-	w.stats.packetsSent.Add(uint64(packets))
-	w.stats.bytesSent.Add(uint64(rawBytes))
-	w.stats.batchesSent.Add(1)
-	if len(newCode) > warnCodeDocBytes {
-		// We own only our block, and every send rewrites it in full, so an
-		// oversized document self-heals on the next batch; the log just names
-		// the culprit size.
-		utils.Debugf("[CUPS] room %s code document is %d bytes after our write", w.auth.roomUUID, len(newCode))
-	}
+// sendChunk sends one message: a 2-byte length of the chunk, then the chunk,
+// packed into cursor integers. The length lets the peer strip the zero
+// padding exactly before stitching the byte stream back.
+func (w *cupsWS) sendChunk(chunk []byte) error {
+	return w.sendChunkID(chunk, w.nextID())
 }
 
-// parseCodeResp extracts code/version from a change_code rpc payload.
-func parseCodeResp(resp json.RawMessage) (code string, ver int64, haveCode, haveVer bool) {
-	if len(resp) == 0 {
-		return
-	}
-	var d struct {
-		Code    *string  `json:"code"`
-		Version *float64 `json:"version"`
-	}
-	if err := json.Unmarshal(resp, &d); err != nil {
-		return
-	}
-	if d.Code != nil {
-		code, haveCode = *d.Code, true
-	}
-	if d.Version != nil {
-		ver, haveVer = int64(*d.Version), true
-	}
-	return
-}
+// sendChunkID is sendChunk with the command id chosen by the caller, so the
+// striped puller can track the id it just put in flight.
+func (w *cupsWS) sendChunkID(chunk []byte, id int64) error {
+	payload := make([]byte, 2+len(chunk))
+	binary.BigEndian.PutUint16(payload[:2], uint16(len(chunk)))
+	copy(payload[2:], chunk)
 
-// adoptServerCode stores an authoritative document copy (change_code reply).
-// It never rolls back below a version already reached via a fresher push.
-func (w *cupsWS) adoptServerCode(code string, ver int64, haveVer bool) {
-	w.codeMu.Lock()
-	if !haveVer || ver >= w.codeVersion {
-		w.serverCode = code
-		if haveVer && ver > w.codeVersion {
-			w.codeVersion = ver
-		}
-	}
-	w.codeMu.Unlock()
-}
-
-// applyChangeSuccess promotes the write into the baseline. If the read loop
-// already adopted a newer full document from a push (serverCode moved past our
-// snapshot), that copy is authoritative and we keep it.
-func (w *cupsWS) applyChangeSuccess(base, newCode string, resp json.RawMessage) {
-	var d struct {
-		Code    *string  `json:"code"`
-		Version *float64 `json:"version"`
-	}
-	if len(resp) > 0 {
-		_ = json.Unmarshal(resp, &d)
-	}
-	w.codeMu.Lock()
-	if w.serverCode == base {
-		if d.Code != nil {
-			w.serverCode = *d.Code
-		} else {
-			w.serverCode = newCode
-		}
-		if d.Version != nil && int64(*d.Version) > w.codeVersion {
-			w.codeVersion = int64(*d.Version)
-		}
-	}
-	w.codeMu.Unlock()
-}
-
-// refreshBaseline refetches the room document over the pending-RPC machinery
-// (safe from the send goroutine; it does NOT touch the read-loop-owned dedupe
-// state, so a peer payload we missed while stale is still delivered when its
-// push (or any later one) arrives).
-func (w *cupsWS) refreshBaseline() error {
-	data, err := w.callRPC("shared_editor_room_info", map[string]interface{}{"room": w.auth.roomUUID}, changeRPCTimeout)
-	if err != nil {
-		return err
-	}
-	var info struct {
-		Code    *string  `json:"code"`
-		Version *float64 `json:"version"`
-	}
-	if err := json.Unmarshal(data, &info); err != nil {
-		return fmt.Errorf("room_info decode: %w", err)
-	}
-	if info.Code == nil {
-		return fmt.Errorf("room_info: no code in reply")
-	}
-	w.codeMu.Lock()
-	w.serverCode = *info.Code
-	if info.Version != nil {
-		w.codeVersion = int64(*info.Version)
-	}
-	w.codeMu.Unlock()
-	utils.Debugf("[CUPS] baseline refreshed (%s): %d bytes", w.auth.roomUUID, len(*info.Code))
-	return nil
-}
-
-// wsFrame is the Centrifugo envelope: RPC replies carry "id" (correlated with
-// our call) plus "rpc"/"error"; server pushes carry "push".
-type wsFrame struct {
-	ID  *int64 `json:"id"`
-	RPC *struct {
-		Data json.RawMessage `json:"data"`
-	} `json:"rpc"`
-	Error *struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-	} `json:"error"`
-	Push json.RawMessage `json:"push"`
-}
-
-// fetchBaselineInline asks shared_editor_room_info for the current document
-// right after subscribe, reading straight off the socket (the read loop is not
-// running yet). Frames that are not our reply — e.g. a peer's code_update that
-// lands first — are served through the normal path. Runs on the read-loop
-// goroutine, so seeding the dedupe state from the fresh baseline is safe.
-func (w *cupsWS) fetchBaselineInline(conn *websocket.Conn) error {
-	id := w.nextID()
 	msg := map[string]interface{}{
 		"rpc": map[string]interface{}{
-			"method": "shared_editor_room_info",
-			"data":   map[string]interface{}{"room": w.auth.roomUUID},
+			"method": "shared_editor_change_cursors",
+			"data": map[string]interface{}{
+				"cursors": cursorsFromBytes(payload),
+				"ranges":  []interface{}{},
+				"room":    w.auth().roomUUID,
+				"user":    w.auth().userUUID,
+			},
 		},
 		"id": id,
 	}
-	if err := w.writeJSON(msg); err != nil {
-		return err
-	}
-	for {
-		select {
-		case <-w.ctx:
-			return fmt.Errorf("closed")
-		default:
-		}
-		conn.SetReadDeadline(time.Now().Add(w.config.WSReadTimeout))
-		_, raw, err := conn.ReadMessage()
-		if err != nil {
-			return err
-		}
-		var fr wsFrame
-		if err := json.Unmarshal(raw, &fr); err != nil {
-			continue
-		}
-		if fr.ID != nil && *fr.ID == id {
-			if fr.Error != nil {
-				return fmt.Errorf("room_info: code=%d %s", fr.Error.Code, fr.Error.Message)
-			}
-			if fr.RPC == nil {
-				return fmt.Errorf("room_info: empty reply")
-			}
-			return w.applyRoomInfo(fr.RPC.Data)
-		}
-		w.handleDecoded(&fr)
-	}
+	return w.writeJSON(msg)
 }
 
-// applyRoomInfo stores the baseline fetched on connect and seeds the peer-data
-// dedupe state from it. Read-loop goroutine only.
-func (w *cupsWS) applyRoomInfo(data json.RawMessage) error {
-	var info struct {
-		Code    *string  `json:"code"`
-		Version *float64 `json:"version"`
-	}
-	if err := json.Unmarshal(data, &info); err != nil {
-		return fmt.Errorf("room_info decode: %w", err)
-	}
-	if info.Code == nil {
-		return fmt.Errorf("room_info: no code in reply")
-	}
-	ver := int64(-1)
-	if info.Version != nil {
-		ver = int64(*info.Version)
-	}
-	w.codeMu.Lock()
-	w.serverCode = *info.Code
-	w.codeVersion = ver
-	w.codeMu.Unlock()
+// bytesPerNumber is how many bytes ride in one row/column integer. cups.online
+// keeps a cursor integer exact up to 2^53-1; 6 bytes (48 bits) stays well
+// inside that and is byte-aligned.
+const bytesPerNumber = 6
 
-	// Anything the peer had already written was delivered in an earlier
-	// session (or is stale); mark it as seen so the next push only counts as
-	// traffic when the peer block actually changes.
-	peer := decodeBlockPayload(extractBlockSide(strings.Split(*info.Code, "\n"), w.peerSide))
-	w.lastPeerHash = hashBytes(peer)
-	w.havePeerState = true
-	if ver > w.observedVer {
-		w.observedVer = ver
+// cursorsFromBytes packs a blob into {row, column} integer pairs. The data
+// rides in the numbers because cups.online rejects a non-numeric column but
+// relays a cursor array of integers verbatim and in order. Trailing padding is
+// zero, which the length-prefixed framing on the far side reads as "no more
+// packets" and stops.
+func cursorsFromBytes(blob []byte) []map[string]interface{} {
+	nums := packNumbers(blob)
+	cursors := make([]map[string]interface{}, 0, (len(nums)+1)/2)
+	for i := 0; i < len(nums); i += 2 {
+		c := map[string]interface{}{"row": nums[i], "column": uint64(0)}
+		if i+1 < len(nums) {
+			c["column"] = nums[i+1]
+		}
+		cursors = append(cursors, c)
 	}
-	utils.Debugf("[CUPS] baseline (%s): %d bytes, version %d", w.auth.roomUUID, len(*info.Code), ver)
-	return nil
+	return cursors
+}
+
+// packNumbers cuts a blob into big-endian bytesPerNumber-byte integers, the
+// last one zero-padded.
+func packNumbers(blob []byte) []uint64 {
+	n := (len(blob) + bytesPerNumber - 1) / bytesPerNumber
+	out := make([]uint64, n)
+	for i := range out {
+		var v uint64
+		for j := 0; j < bytesPerNumber; j++ {
+			v <<= 8
+			if idx := i*bytesPerNumber + j; idx < len(blob) {
+				v |= uint64(blob[idx])
+			}
+		}
+		out[i] = v
+	}
+	return out
+}
+
+// bytesFromNumbers reverses packNumbers.
+func bytesFromNumbers(nums []uint64) []byte {
+	out := make([]byte, 0, len(nums)*bytesPerNumber)
+	for _, v := range nums {
+		var b [bytesPerNumber]byte
+		for j := bytesPerNumber - 1; j >= 0; j-- {
+			b[j] = byte(v)
+			v >>= 8
+		}
+		out = append(out, b[:]...)
+	}
+	return out
+}
+
+// asCursorInt reads a JSON number back as an integer. Values stay under 2^48,
+// which float64 (how encoding/json hands back a number) holds exactly.
+func asCursorInt(v interface{}) (uint64, bool) {
+	f, ok := v.(float64)
+	if !ok || f < 0 {
+		return 0, false
+	}
+	return uint64(f), true
 }
 
 func (w *cupsWS) handleMessage(raw []byte) {
-	// Centrifugo low-level ping: bare "{}" frame, reply verbatim.
-	if len(raw) == 2 && raw[0] == '{' && raw[1] == '}' {
+	for _, line := range splitFrame(raw) {
+		w.handleReply(line)
+	}
+}
+
+// handleReply handles one message: a server ping, or a push that may carry
+// a batch from the peer.
+func (w *cupsWS) handleReply(raw []byte) {
+	if isPing(raw) {
 		_ = w.writeRaw([]byte("{}"))
 		return
 	}
-	var fr wsFrame
-	if err := json.Unmarshal(raw, &fr); err != nil {
+	var obj map[string]interface{}
+	if err := json.Unmarshal(raw, &obj); err != nil {
 		return
 	}
-	w.handleDecoded(&fr)
-}
-
-func (w *cupsWS) handleDecoded(fr *wsFrame) {
-	if fr.ID != nil {
-		id := *fr.ID
-		w.pendingMu.Lock()
-		ch, ok := w.pending[id]
-		if ok {
-			delete(w.pending, id)
-		}
-		w.pendingMu.Unlock()
-		if ok {
-			switch {
-			case fr.Error != nil:
-				ch <- rpcResp{err: fmt.Errorf("server rpc error %d: %s", fr.Error.Code, fr.Error.Message)}
-			case fr.RPC != nil:
-				ch <- rpcResp{data: fr.RPC.Data}
+	// A reply to one of our cursor RPCs (ok or error) frees a slot in the
+	// ack gate and wakes the puller. Keepalive and handshake replies carry
+	// ids too but are not in dataIDs, so they're left alone.
+	if idf, ok := obj["id"].(float64); ok {
+		if _, had := w.dataIDs.LoadAndDelete(int64(idf)); had {
+			if w.inflight.Add(-1) < 0 {
+				w.inflight.Store(0)
+			}
+			select {
+			case w.wake <- struct{}{}:
 			default:
-				ch <- rpcResp{err: fmt.Errorf("empty rpc reply for id %d", id)}
 			}
 		}
 	}
-	if fr.Push == nil {
-		return
-	}
-	var push struct {
-		Channel string `json:"channel"`
-		Pub     struct {
-			Data struct {
-				Type    string          `json:"type"`
-				Payload json.RawMessage `json:"payload"`
-			} `json:"data"`
-			Offset uint64 `json:"offset"`
-		} `json:"pub"`
-	}
-	if err := json.Unmarshal(fr.Push, &push); err != nil {
-		return
-	}
-	switch push.Pub.Data.Type {
-	case "code_update":
-		w.handleCodeUpdate(push.Pub.Data.Payload)
-	}
-}
-
-// handleCodeUpdate processes the {"type":"code_update","payload":{uuid,code,
-// version}} push. The payload carries the FULL room document: it keeps our
-// diff baseline fresh, and our side's packets are read from the peer's block.
-func (w *cupsWS) handleCodeUpdate(payloadRaw json.RawMessage) {
-	var p struct {
-		UUID    string   `json:"uuid"`
-		Code    *string  `json:"code"`
-		Version *float64 `json:"version"`
-	}
-	if err := json.Unmarshal(payloadRaw, &p); err != nil || p.Code == nil {
-		return
-	}
-	code := *p.Code
-	haveVer := p.Version != nil
-	ver := int64(-1)
-	if haveVer {
-		ver = int64(*p.Version)
-	}
-
-	// Adopt the full document as baseline whenever it is newer than what we
-	// hold (a push we have not seen must never roll the version back).
-	w.codeMu.Lock()
-	if (haveVer && ver > w.codeVersion) || (!haveVer && w.codeVersion < 0) {
-		w.serverCode = code
-		if haveVer {
-			w.codeVersion = ver
-		}
-	}
-	w.codeMu.Unlock()
-
-	if haveVer && w.havePeerState && ver <= w.observedVer {
-		return // stale pub (resubscribe replay / duplicate delivery)
-	}
-	peerBytes := decodeBlockPayload(extractBlockSide(strings.Split(code, "\n"), w.peerSide))
-	h := hashBytes(peerBytes)
-	if w.havePeerState && h == w.lastPeerHash {
-		// Peer block unchanged: this is our own edit (or a filler push)
-		// echoing back. Track the version so late replays stay filtered.
-		if haveVer && ver > w.observedVer {
-			w.observedVer = ver
+	if e, ok := obj["error"]; ok {
+		// A message of ours the server would not take (it never reached the
+		// peer): the stripe resends its pieces; worth seeing when it happens.
+		if n := w.stats.rpcErrors.Add(1); n == 1 || n%100 == 0 {
+			utils.Debugf("[CUPS] room %s turned down a message (%d so far): %v", shortRoom(w.roomUUID), n, e)
 		}
 		return
 	}
-	count, total := splitPackets(peerBytes, w.onData)
-	if haveVer && ver > w.observedVer {
-		w.observedVer = ver
+	push, ok := obj["push"].(map[string]interface{})
+	if !ok {
+		return
 	}
-	w.lastPeerHash = h
-	w.havePeerState = true
+	pub, _ := push["pub"].(map[string]interface{})
+	data, _ := pub["data"].(map[string]interface{})
+	if data == nil {
+		return
+	}
+	if t, _ := data["type"].(string); t != "cursors_update" {
+		return
+	}
+	payload, _ := data["payload"].(map[string]interface{})
+	if payload == nil {
+		return
+	}
+	sender, _ := payload["user_uuid"].(string)
+	if sender == w.auth().userUUID {
+		return
+	}
+	cursors, _ := payload["cursors"].([]interface{})
+	if len(cursors) == 0 {
+		return
+	}
+	// Rebuild the blob from the cursor integers, two per cursor in order, the
+	// reverse of cursorsFromBytes.
+	nums := make([]uint64, 0, len(cursors)*2)
+	for _, c := range cursors {
+		m, _ := c.(map[string]interface{})
+		if m == nil {
+			return
+		}
+		row, ok := asCursorInt(m["row"])
+		if !ok {
+			return
+		}
+		col, _ := asCursorInt(m["column"])
+		nums = append(nums, row, col)
+	}
+	decoded := bytesFromNumbers(nums)
+	// Strip the padding: the first two bytes are how many real bytes follow.
+	if len(decoded) < 2 {
+		return
+	}
+	dataLen := int(binary.BigEndian.Uint16(decoded[:2]))
+	if 2+dataLen > len(decoded) {
+		return
+	}
+	chunk := decoded[2 : 2+dataLen]
+	if w.framed {
+		w.readWhole(chunk)
+		return
+	}
+
+	// Append to the running stream and pull out whole packets; a packet split
+	// across messages completes once the rest of it arrives.
+	if w.recvBufs == nil {
+		w.recvBufs = make(map[string][]byte)
+	}
+	buf := append(w.recvBufs[sender], chunk...)
+	adv, count, total := 0, 0, 0
+	for len(buf)-adv >= 2 {
+		ln := int(binary.BigEndian.Uint16(buf[adv : adv+2]))
+		if ln == 0 {
+			// Not a real length - the stream is out of sync; drop it.
+			adv = len(buf)
+			break
+		}
+		if len(buf)-adv < 2+ln {
+			break // rest of this packet hasn't arrived yet
+		}
+		pkt := buf[adv+2 : adv+2+ln]
+		if w.onData != nil {
+			w.onData(pkt)
+		}
+		adv += 2 + ln
+		count++
+		total += ln
+	}
+	// Keep only the unconsumed tail. onData ran already, so moving the bytes
+	// now can't disturb a packet still in flight. A member with nothing
+	// pending holds no buffer, so members who left cost nothing.
+	rest := append(buf[:0], buf[adv:]...)
+	switch {
+	case len(rest) == 0:
+		delete(w.recvBufs, sender)
+	case len(rest) > w.config.MaxPayloadBytes+w.config.MaxMessageData:
+		// A stream that never yields a packet must not grow without bound.
+		utils.Debugf("[CUPS] recv stream out of sync (%s), resetting", w.roomUUID)
+		delete(w.recvBufs, sender)
+	default:
+		w.recvBufs[sender] = rest
+	}
 	if count > 0 {
 		w.stats.packetsRecv.Add(uint64(count))
 		w.stats.bytesRecv.Add(uint64(total))
@@ -1544,447 +1329,36 @@ func (w *cupsWS) handleCodeUpdate(payloadRaw json.RawMessage) {
 	}
 }
 
-func hashBytes(b []byte) uint64 {
-	h := fnv.New64a()
-	h.Write(b)
-	return h.Sum64()
-}
-
-// ---- code channel: blocks, diff, framing ----
-
-const (
-	// diffContextChars is the size of the keep-chunk (context) the server
-	// dialect verifies at the patch offset, in runes.
-	diffContextChars = 12
-	// b64LineChunk keeps base64 payload lines short so the diff stays
-	// line-granular and chunk bodies remain small.
-	b64LineChunk = 200
-	// maxChangeCodeAttempts bounds the stale-baseline retry loop.
-	maxChangeCodeAttempts = 3
-	// changeRPCTimeout bounds one RPC round-trip on the send path.
-	changeRPCTimeout = 10 * time.Second
-	// warnCodeDocBytes only triggers a debug log; our block always replaces
-	// itself wholesale, so oversized documents self-heal.
-	warnCodeDocBytes = 64 * 1024
-)
-
-// reBlockMarker matches our fences, e.g. "//OCX-2-BEGIN". The side letter
-// ("X" exit / "Y" client) is what distinguishes ours from the peer's.
-var reBlockMarker = regexp.MustCompile(`^//OC([XY])-(\d+)-(BEGIN|END)$`)
-
-func blockMarker(side string, idx int, kind string) string {
-	return fmt.Sprintf("//OC%s-%d-%s", side, idx, kind)
-}
-
-func parseBlockMarker(line string) (side string, idx int, kind string, ok bool) {
-	m := reBlockMarker.FindStringSubmatch(line)
-	if m == nil {
-		return "", 0, "", false
-	}
-	i, _ := strconv.Atoi(m[2])
-	return m[1], i, m[3], true
-}
-
-// removeBlockSide drops every block fenced for the given side (marker lines
-// inclusive). Everything else — template text, the peer's block — passes
-// through byte-identical, which makes our diff hunks never touch foreign
-// lines. An unterminated own block at EOF is ours too and gets dropped whole.
-func removeBlockSide(lines []string, side string) []string {
-	out := make([]string, 0, len(lines))
-	skip := false
-	for _, ln := range lines {
-		if s, _, kind, ok := parseBlockMarker(ln); ok && s == side {
-			if kind == "BEGIN" {
-				skip = true
-				continue
-			}
-			if kind == "END" {
-				skip = false
-				continue
-			}
-		}
-		if skip {
-			continue
-		}
-		out = append(out, ln)
-	}
-	return out
-}
-
-// extractBlockSide returns the concatenated body of the first complete block
-// fenced for the given side, or "" when absent/unterminated.
-func extractBlockSide(lines []string, side string) string {
-	var sb strings.Builder
-	inBlock := false
-	for _, ln := range lines {
-		if s, _, kind, ok := parseBlockMarker(ln); ok && s == side {
-			if kind == "BEGIN" {
-				if inBlock {
-					sb.Reset() // unterminated earlier block: newest wins
-				}
-				inBlock = true
-				continue
-			}
-			if kind == "END" {
-				if inBlock {
-					return sb.String()
-				}
-				continue
-			}
-		}
-		if inBlock {
-			sb.WriteString(strings.Join(strings.Fields(ln), ""))
-		}
-	}
-	return ""
-}
-
-// chunkLines chops the base64 payload into lines of at most b64LineChunk
-// characters.
-func chunkLines(s string) []string {
-	if s == "" {
-		return nil
-	}
-	var out []string
-	for i := 0; i < len(s); i += b64LineChunk {
-		e := i + b64LineChunk
-		if e > len(s) {
-			e = len(s)
-		}
-		out = append(out, s[i:e])
-	}
-	return out
-}
-
-// blockText is the fenced block as it lives inside the document, WITHOUT a
-// trailing newline: "//OCX-<i>-BEGIN\n<chunk>\n...<chunk>\n//OCX-<i>-END".
-// The DATA REGION is the runes strictly between the BEGIN line's "\n" and the
-// END marker text — each chunk line (including the last) is "\n"-terminated
-// inside the region, so the "\n" that closes the region is its final rune and
-// the END line stays intact outside it.
-func blockText(side string, idx int, chunks []string) string {
-	var sb strings.Builder
-	sb.WriteString(blockMarker(side, idx, "BEGIN"))
-	sb.WriteString("\n")
-	for _, c := range chunks {
-		sb.WriteString(c)
-		sb.WriteString("\n")
-	}
-	sb.WriteString(blockMarker(side, idx, "END"))
-	return sb.String()
-}
-
-// cupsBlock locates one fenced block inside the document; byte indexes are
-// offsets into the raw string, rune indexes are the Unicode code-point counts
-// the SERVER patch dialect uses (Cyrillic template!).
-type cupsBlock struct {
-	side string
-	idx  int
-
-	beginByte      int // at '/' of "//OC..." on the BEGIN line
-	dataStartByte  int // just after the BEGIN line's "\n"
-	dataEndByte    int // at '/' of the END marker text
-	endTextEndByte int // just after the END marker text (before its "\n")
-
-	beginRune      int
-	dataStartRune  int
-	endTextEndRune int
-}
-
-// reBlockMarkerML is reBlockMarker in multi-line mode: our fences always sit
-// alone on their line.
-var reBlockMarkerML = regexp.MustCompile(`(?m)^//OC([XY])-(\d+)-(BEGIN|END)$`)
-
-// findBlocks locates every fenced block of one side, in order. A BEGIN whose
-// marker is not followed by "\n", or that has no matching END, is ignored.
-func findBlocks(doc string, side string) []cupsBlock {
-	var out []cupsBlock
-	for _, bm := range reBlockMarkerML.FindAllStringSubmatchIndex(doc, -1) {
-		if doc[bm[2]:bm[3]] != side || doc[bm[6]:bm[7]] != "BEGIN" {
-			continue
-		}
-		if bm[1] >= len(doc) || doc[bm[1]] != '\n' {
-			continue
-		}
-		idx, _ := strconv.Atoi(doc[bm[4]:bm[5]])
-		dataStart := bm[1] + 1
-		for _, em := range reBlockMarkerML.FindAllStringSubmatchIndex(doc, -1) {
-			if em[0] < dataStart || doc[em[2]:em[3]] != side || doc[em[6]:em[7]] != "END" {
-				continue
-			}
-			if eidx, _ := strconv.Atoi(doc[em[4]:em[5]]); eidx != idx {
-				continue
-			}
-			out = append(out, cupsBlock{
-				side:           side,
-				idx:            idx,
-				beginByte:      bm[0],
-				dataStartByte:  dataStart,
-				dataEndByte:    em[0],
-				endTextEndByte: em[1],
-				beginRune:      utf8.RuneCountInString(doc[:bm[0]]),
-				dataStartRune:  utf8.RuneCountInString(doc[:dataStart]),
-				endTextEndRune: utf8.RuneCountInString(doc[:em[1]]),
-			})
-			break
-		}
-	}
-	return out
-}
-
-// runeTailStart returns the BYTE index where the last n runes of s begin.
-func runeTailStart(s string, n int) int {
-	i := len(s)
-	for r := 0; r < n && i > 0; r++ {
-		_, size := utf8.DecodeLastRuneInString(s[:i])
-		i -= size
-	}
-	return i
-}
-
-// contiguousBlocks reports whether every block in the run sits immediately
-// after the previous block's END-line terminator: nothing foreign lies between
-// our blocks and one hunk can rewrite the whole run.
-func contiguousBlocks(blocks []cupsBlock) bool {
-	for i := 1; i < len(blocks); i++ {
-		if blocks[i-1].endTextEndByte+1 != blocks[i].beginByte {
-			return false
-		}
-	}
-	return true
-}
-
-// buildStrayPrune emits the single-hunk "-" replace that deletes the first
-// stray block of our side. A stale-baseline recovery whose patch a fuzzy
-// server apply turned into a SECOND fenced block for us must not live with
-// it: the peer reads the first complete block (extractBlockSide), so block 0
-// keeps carrying the payload and every later, foreign-separated copy is
-// document-size dead weight no data-region edit can reach (template or peer
-// text lies between). One prune per send converges the document; adjacent
-// runs never need it — buildBlockEdit already collapses those in place.
-func buildStrayPrune(doc string, side string) (string, string, bool) {
-	blocks := findBlocks(doc, side)
-	if len(blocks) < 2 || contiguousBlocks(blocks) {
-		return "", "", false
-	}
-	s := blocks[1] // keep block 0 (what the peer reads), prune the first stray
-	delEnd := s.endTextEndByte
-	if delEnd < len(doc) && doc[delEnd] == '\n' {
-		delEnd++ // the END line complete, terminator included
-	}
-	del := doc[s.beginByte:delEnd]
-	ctxBytes := runeTailStart(doc[:s.beginByte], diffContextChars)
-	ctx := doc[ctxBytes:s.beginByte]
-	newDoc := doc[:s.beginByte] + doc[delEnd:]
-	return newDoc, makeDiff(s.beginRune-utf8.RuneCountInString(ctx), ctx, del, ""), true
-}
-
-// buildBlockEdit computes (newDoc, diff, changed) for writing payloadB64 into
-// our fenced block, using the server's character-offset patch dialect. Only a
-// single contiguous region can be rewritten per hunk, which is exactly our
-// edit shape:
-//
-//   - no block yet          → pure append: ctx = last diffContextChars runes
-//     of the doc, no "-" line, ins = "\n"+block+"\n".
-//   - exactly one block     → replace the DATA REGION in place; ctx = the 12
-//     runes ending at the region start (the tail of our own BEGIN line,
-//     unique per side).
-//   - several contiguous    → collapse: one hunk deletes the whole run of our
-//     blocks and inserts a single fresh one.
-//   - several, not adjacent → rewrite the FIRST one (what the peer's
-//     extractBlockSide reads); sendBatch prunes the stray copies with a
-//     dedicated "-" replace before the payload write.
-//
-// changed=false means the region already holds exactly this payload: sending
-// would be a no-op patch, so the caller can skip the RPC entirely.
-func buildBlockEdit(doc string, side string, idx int, payloadB64 string) (string, string, bool) {
-	chunks := chunkLines(payloadB64)
-	data := ""
-	for _, c := range chunks {
-		data += c + "\n"
-	}
-	text := blockText(side, idx, chunks)
-	blocks := findBlocks(doc, side)
-
-	if len(blocks) == 0 {
-		a := utf8.RuneCountInString(doc)
-		ctx := doc[runeTailStart(doc, diffContextChars):]
-		ins := text + "\n"
-		if doc != "" && !strings.HasSuffix(doc, "\n") {
-			ins = "\n" + ins
-		}
-		return doc + ins, makeDiff(a-utf8.RuneCountInString(ctx), ctx, "", ins), true
-	}
-
-	if len(blocks) == 1 {
-		b := blocks[0]
-		del := doc[b.dataStartByte:b.dataEndByte]
-		if del == data {
-			return doc, "", false
-		}
-		ctxBytes := runeTailStart(doc[:b.dataStartByte], diffContextChars)
-		ctx := doc[ctxBytes:b.dataStartByte]
-		newDoc := doc[:b.dataStartByte] + data + doc[b.dataEndByte:]
-		return newDoc, makeDiff(b.dataStartRune-utf8.RuneCountInString(ctx), ctx, del, data), true
-	}
-
-	// Contiguous run of our blocks? (the only "\n" between block k and k+1 is
-	// block k's END-line terminator)
-	k := 0
-	for k+1 < len(blocks) && blocks[k].endTextEndByte+1 == blocks[k+1].beginByte {
-		k++
-	}
-	if k+1 < len(blocks) {
-		utils.Debugf("[CUPS] %d blocks for side %s, only %d adjacent — rewriting the first one", len(blocks), side, k+1)
-		// The peer reads the FIRST complete block (extractBlockSide), so the
-		// first one carries the payload; sendBatch prunes the strays on the
-		// way (buildStrayPrune) so this stays the only block.
-		b := blocks[0]
-		ctxBytes := runeTailStart(doc[:b.dataStartByte], diffContextChars)
-		ctx := doc[ctxBytes:b.dataStartByte]
-		newDoc := doc[:b.dataStartByte] + data + doc[b.dataEndByte:]
-		return newDoc, makeDiff(b.dataStartRune-utf8.RuneCountInString(ctx), ctx, doc[b.dataStartByte:b.dataEndByte], data), true
-	}
-
-	first, last := blocks[0], blocks[k]
-	del := doc[first.beginByte:last.endTextEndByte]
-	ctxBytes := runeTailStart(doc[:first.beginByte], diffContextChars)
-	ctx := doc[ctxBytes:first.beginByte]
-	newDoc := doc[:first.beginByte] + text + doc[last.endTextEndByte:]
-	return newDoc, makeDiff(first.beginRune-utf8.RuneCountInString(ctx), ctx, del, text), true
-}
-
-// decodeBlockPayload decodes the concatenated base64 body written by our own
-// encoder (unpadded first, padded as fallback).
-func decodeBlockPayload(b64 string) []byte {
-	if b64 == "" {
-		return nil
-	}
-	raw, err := base64.RawStdEncoding.DecodeString(b64)
-	if err != nil {
-		raw2, err2 := base64.StdEncoding.DecodeString(b64)
-		if err2 != nil {
-			return nil
-		}
-		raw = raw2
-	}
-	return raw
-}
-
-// framePackets / splitPackets: the wire framing inside a block — one
-// 2-byte big-endian length per packet (identical to the old cursor channel).
-func framePackets(batch [][]byte) ([]byte, int) {
-	var buf bytes.Buffer
-	var hdr [2]byte
-	total := 0
-	for _, p := range batch {
-		binary.BigEndian.PutUint16(hdr[:], uint16(len(p)))
-		buf.Write(hdr[:])
-		buf.Write(p)
-		total += len(p)
-	}
-	return buf.Bytes(), total
-}
-
-func splitPackets(raw []byte, onData func([]byte)) (int, int) {
+// readWhole hands on the packets of one message on the striped wire, where a
+// message holds whole packets only (pullLoop).
+func (w *cupsWS) readWhole(chunk []byte) {
 	count, total := 0, 0
-	for len(raw) >= 2 {
-		ln := int(binary.BigEndian.Uint16(raw[:2]))
-		raw = raw[2:]
-		if ln == 0 || len(raw) < ln {
+	for len(chunk) >= 2 {
+		ln := int(binary.BigEndian.Uint16(chunk))
+		if ln == 0 || 2+ln > len(chunk) {
 			break
 		}
-		pkt := raw[:ln]
-		raw = raw[ln:]
-		if onData != nil {
-			onData(pkt)
+		if w.onData != nil {
+			w.onData(chunk[2 : 2+ln])
 		}
+		chunk = chunk[2+ln:]
 		count++
 		total += ln
 	}
-	return count, total
-}
-
-// jsEncode percent-encodes one diff line with JS encodeURIComponent semantics:
-// alphanumerics and -_.!~*'() stay literal, every other byte becomes %XX with
-// upper-hex (UTF-8 bytes for non-ASCII, exactly as the browser sends them).
-func jsEncode(s string) string {
-	const hex = "0123456789ABCDEF"
-	var b strings.Builder
-	b.Grow(len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
-			c == '-', c == '_', c == '.', c == '!', c == '~', c == '*',
-			c == '\'', c == '(', c == ')':
-			b.WriteByte(c)
-		default:
-			b.WriteByte('%')
-			b.WriteByte(hex[c>>4])
-			b.WriteByte(hex[c&0x0f])
-		}
+	if count > 0 {
+		w.stats.packetsRecv.Add(uint64(count))
+		w.stats.bytesRecv.Add(uint64(total))
+		w.stats.batchesRecv.Add(1)
 	}
-	return b.String()
-}
-
-// makeDiff emits the patch in the format cups.online's shared_editor_change_
-// code actually accepts (verified against live frames, 2026-10): the "@@"
-// numbers are ABSOLUTE CHARACTER (Unicode code point, 0-based) offsets into
-// the stored document and character LENGTHS — not line numbers, not bytes.
-// Body lines are whole percent-encoded chunks that may carry %0A inside:
-//
-//	" " chunk — keep/context: the runes at the offset must equal this chunk
-//	"-" chunk — deleted text, sitting right after the context in the old doc
-//	"-" line is omitted when nothing is deleted
-//	"+" chunk — inserted text, spliced in right after the context
-//
-// Header accounting (both live probes confirm): old length = |ctx|+|del|,
-// new length = |ctx|+|ins|, context counted on BOTH sides, offset = start of
-// the context chunk. The server silently NO-OPS (but bumps the version) when
-// the context/delete chunks do not sit verbatim at those offsets, so the
-// caller must verify the code returned by the RPC against the expected
-// result. jsEncode is applied per whole chunk, so interior newlines become
-// %0A inside a single body line.
-func makeDiff(offset int, ctx, del, ins string) string {
-	oLen := utf8.RuneCountInString(ctx) + utf8.RuneCountInString(del)
-	nLen := utf8.RuneCountInString(ctx) + utf8.RuneCountInString(ins)
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "@@ -%d,%d +%d,%d @@\n", offset, oLen, offset, nLen)
-	b.WriteString(" " + jsEncode(ctx) + "\n")
-	if del != "" {
-		b.WriteString("-" + jsEncode(del) + "\n")
-	}
-	if ins != "" {
-		b.WriteString("+" + jsEncode(ins) + "\n")
-	}
-	return b.String()
 }
 
 func (w *cupsWS) Send(data []byte) error {
-	if len(data) > w.config.MaxPayloadBytes {
-		return fmt.Errorf("too large: %d", len(data))
-	}
 	select {
 	case w.sendQueue <- data:
 		return nil
-	case <-w.ctx:
-		return fmt.Errorf("closed")
+	case <-w.ctx.Done():
+		return errStopped
 	}
-}
-
-// ---- flow key ----
-
-type flowKey struct {
-	srcIP, dstIP     uint32
-	srcPort, dstPort uint16
-	proto            uint8
-}
-
-type flowSender struct {
-	seq   atomic.Uint64
-	chIdx int
 }
 
 // ---- Transport ----
@@ -1992,27 +1366,207 @@ type flowSender struct {
 type CupsonlineTransport struct {
 	*transport.BaseTransport
 
-	baseURL   string
-	urls      []string
+	baseURL string
+	// roomIDs are the rooms to join, from --url. Empty on an exit node
+	// means "create new ones"; a client can't start without them.
+	roomIDs   []string
 	config    CupsonlineConfig
 	isClient  bool
 	clientErr error
+	// striped: the rooms are the lanes of a stripe (the list says so, or an
+	// exit creates new rooms); otherwise frames go round-robin, the old wire.
+	striped bool
+	stripe  atomic.Pointer[transport.StripedTransport]
 
-	auths []*cupsAuth
-	wss   []*cupsWS
-
-	flowMu sync.RWMutex
-	flows  map[flowKey]*flowSender
-
-	cookieJar *cookiejar.Jar
-	jarMu     sync.RWMutex
-
-	stopCh     chan struct{}
-	statsStart time.Time
-
+	// roomList is the packed list of the rooms this transport keeps
+	// channels to, as clients need it in --url; "" until Start got them.
 	roomsMu    sync.Mutex
 	roomList   string
 	onRoomList func(packed string)
+
+	// ctx ends with Stop and takes every room's goroutines down with it.
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	wss []*cupsWS
+	// rr round-robins outbound frames across the connected rooms; see Send.
+	rr atomic.Uint32
+
+	statsStart time.Time
+}
+
+func NewCupsonlineTransport(rawURL string, cfg transport.TransportConfig, isClient bool) *CupsonlineTransport {
+	ctx, cancel := context.WithCancel(context.Background())
+	t := &CupsonlineTransport{
+		BaseTransport: transport.NewBaseTransport(cfg),
+		config:        DefaultCupsonlineConfig(),
+		isClient:      isClient,
+		ctx:           ctx,
+		cancel:        cancel,
+		statsStart:    time.Now(),
+	}
+
+	t.baseURL = baseRoomURL
+	// Measuring knobs: CUPS_SEND_MS (SendInterval), CUPS_MSG_BYTES
+	// (MaxMessageData, at most 8192: the stripe's pieces are cut for it).
+	if ms := envInt("CUPS_SEND_MS"); ms > 0 {
+		t.config.SendInterval = time.Duration(ms) * time.Millisecond
+	}
+	if n := envInt("CUPS_MSG_BYTES"); n >= 2048 && n <= 12288 {
+		t.config.MaxMessageData = n
+	}
+	// CUPS_WINDOW overrides the ack gate's depth (0 turns it off).
+	if s := os.Getenv("CUPS_WINDOW"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n >= 0 {
+			t.config.SendWindow = n
+		}
+	}
+	// CUPS_ROOMS sets how many rooms a fresh exit creates (= stripe lanes).
+	// Each room relays ~130-200 KB/s, so throughput scales with rooms; the
+	// client follows whatever list the exit prints.
+	if n := envInt("CUPS_ROOMS"); n > 0 && n <= transport.MaxLanes() {
+		t.config.NumRooms = n
+	}
+	// Both roles accept a room list: the client always needs one, and an
+	// exit node given one re-joins those rooms instead of creating new
+	// ones, so a restart doesn't hand the phone a new string every time.
+	t.roomIDs, t.striped = parseRooms(rawURL)
+	if len(t.roomIDs) == 0 && !isClient {
+		t.striped = stripeNewRooms()
+	}
+	if isClient && len(t.roomIDs) == 0 {
+		t.clientErr = fmt.Errorf("client mode: --url must contain base64 room list")
+	}
+	return t
+}
+
+// roomSlot is one room the transport will keep a channel to.
+type roomSlot struct {
+	id   string
+	auth *cupsAuth // nil if it couldn't be entered yet
+	err  error     // why it couldn't
+}
+
+func (t *CupsonlineTransport) Start() error {
+	if t.clientErr != nil {
+		return t.clientErr
+	}
+	if err := t.BaseTransport.Start(); err != nil {
+		return err
+	}
+
+	slots, err := t.enterRooms()
+	if err != nil {
+		return err
+	}
+	if t.ctx.Err() != nil {
+		return errStopped
+	}
+
+	joinedAt := time.Now()
+	wss := make([]*cupsWS, len(slots))
+	for i, s := range slots {
+		ws := &cupsWS{
+			idx:         i,
+			roomUUID:    s.id,
+			joinedAt:    joinedAt,
+			goneDelay:   t.config.RoomGoneRetryMin,
+			onRoomState: t.reportRooms,
+			config:      t.config,
+			ctx:         t.ctx,
+			sendQueue:   make(chan []byte, t.config.SendQueueSize),
+			wake:        make(chan struct{}, 1),
+			window:      t.config.SendWindow,
+			framed:      t.striped,
+			stats:       &channelStats{idx: i, roomUUID: s.id},
+		}
+		// Command ids 1 and 2 are connect and subscribe.
+		ws.rpcID.Store(2)
+		if s.auth != nil {
+			ws.authPtr.Store(s.auth)
+			ws.session = s.auth.httpClient
+		}
+		// Already reported by enterRooms; run() only probes it now and then.
+		ws.dead.Store(errors.Is(s.err, errRoomGone))
+		ws.onData = t.CallReceive
+		wss[i] = ws
+	}
+	t.wss = wss
+	if t.striped {
+		// Wires every room in as a lane (sets each one's pull) before the
+		// send loops start, so they come up pulling.
+		if err := t.startStripe(); err != nil {
+			return err
+		}
+	}
+	for _, ws := range wss {
+		go ws.run()
+		go ws.sendLoop()
+	}
+
+	utils.Debugf("[CUPS] transport started: %d channels, striped=%v", len(t.wss), t.striped)
+	t.SetConnected(true)
+
+	go t.statsLoop()
+	return nil
+}
+
+// enterRooms joins the rooms from --url, or, on an exit node without them,
+// creates new ones and prints the string for the client.
+func (t *CupsonlineTransport) enterRooms() ([]roomSlot, error) {
+	if len(t.roomIDs) > 0 {
+		slots := t.joinListed()
+		joined, allGone := 0, true
+		for _, s := range slots {
+			if s.auth != nil {
+				joined++
+			} else if !errors.Is(s.err, errRoomGone) {
+				allGone = false
+			}
+		}
+		if t.ctx.Err() != nil {
+			return nil, errStopped
+		}
+		utils.Infof("[CUPS] Cups: зашли в %d из %d комнат", joined, len(slots))
+		// The rooms that failed get a channel all the same and keep being
+		// retried. Dropping them left the peer's traffic in those rooms with
+		// nobody listening.
+		if joined > 0 {
+			t.setRoomList(t.roomIDs)
+			return slots, nil
+		}
+		switch {
+		case t.isClient && allGone:
+			utils.Infof("[ERROR] Cups: все комнаты закрыты - пересоздайте комнаты на ноде (запуск без --url) и обновите строку в профиле")
+			return nil, fmt.Errorf("no rooms joined: all rooms are gone")
+		case t.isClient:
+			utils.Infof("[ERROR] Cups: ни одна комната не отвечает - проверьте сеть")
+			return nil, fmt.Errorf("no rooms joined")
+		case !allGone:
+			// New rooms because of a network hiccup would cost the phone its
+			// string for nothing. Fail, and let the restart try again.
+			utils.Infof("[ERROR] Cups: сохранённые комнаты не отвечают - новые не создаю, чтобы строка на телефоне осталась прежней")
+			return nil, fmt.Errorf("saved rooms unreachable")
+		}
+		utils.Infof("[ERROR] Cups: сохранённые комнаты закрыты, создаю новые - строку на телефоне нужно будет заменить")
+	}
+
+	auths, err := createRooms(t.ctx, t.baseURL, t.config.NumRooms, t.config.RoomCreatePause)
+	if err != nil {
+		return nil, fmt.Errorf("create rooms: %w", err)
+	}
+	slots := make([]roomSlot, len(auths))
+	ids := make([]string, len(auths))
+	for i, a := range auths {
+		slots[i] = roomSlot{id: a.roomUUID, auth: a}
+		ids[i] = a.roomUUID
+	}
+	fmt.Printf("\n=== COPY THIS TO CLIENT ===\n")
+	fmt.Printf("%s\n", transport.PackRooms(ids, t.striped))
+	fmt.Printf("===========================\n")
+	fmt.Printf("Save it and pass it back as --url to reuse these rooms after a restart.\n\n")
+	t.setRoomList(ids)
+	return slots, nil
 }
 
 // RoomList is the packed list of the rooms this transport keeps channels
@@ -2032,10 +1586,8 @@ func (t *CupsonlineTransport) OnRoomList(f func(packed string)) {
 	t.roomsMu.Unlock()
 }
 
-// setRoomList publishes the packed room list and notifies the watcher
-// (the session's share-link code) when it changed.
-func (t *CupsonlineTransport) setRoomList(auths []*cupsAuth) {
-	packed := packRooms(auths)
+func (t *CupsonlineTransport) setRoomList(ids []string) {
+	packed := transport.PackRooms(ids, t.striped)
 	t.roomsMu.Lock()
 	changed := packed != t.roomList
 	t.roomList = packed
@@ -2046,179 +1598,108 @@ func (t *CupsonlineTransport) setRoomList(auths []*cupsAuth) {
 	}
 }
 
-func NewCupsonlineTransport(rawURL string, cfg transport.TransportConfig, isClient bool) *CupsonlineTransport {
-	jar, _ := cookiejar.New(nil)
-	t := &CupsonlineTransport{
-		BaseTransport: transport.NewBaseTransport(cfg),
-		config:        DefaultCupsonlineConfig(),
-		isClient:      isClient,
-		flows:         make(map[flowKey]*flowSender),
-		cookieJar:     jar,
-		stopCh:        make(chan struct{}),
-		statsStart:    time.Now(),
+// joinListed enters all the listed rooms at once rather than one by one: on
+// a phone each join is two round trips, and Start blocks the app until
+// they're done.
+func (t *CupsonlineTransport) joinListed() []roomSlot {
+	slots := make([]roomSlot, len(t.roomIDs))
+	var wg sync.WaitGroup
+	for i, id := range t.roomIDs {
+		slots[i].id = id
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			slots[i].auth, slots[i].err = joinRoom(t.ctx, id, nil)
+		}()
 	}
-
-	if !isClient {
-		t.baseURL = roomBaseURL
-		return t
-	}
-
-	var ids []string
-	if rawURL != "" {
-		if u, err := url.Parse(rawURL); err == nil {
-			q := u.Query()
-			if packed := q.Get("rooms"); packed != "" {
-				if got, err := unpackRooms(packed); err == nil {
-					ids = got
-				}
-			} else if single := q.Get("room"); single != "" {
-				ids = []string{single}
-			}
+	wg.Wait()
+	for _, s := range slots {
+		if s.err != nil && t.ctx.Err() == nil {
+			utils.Infof("[ERROR] Cups: не удалось зайти в комнату %s: %v", shortRoom(s.id), s.err)
 		}
 	}
-	if len(ids) == 0 && rawURL != "" {
-		if got, err := unpackRooms(rawURL); err == nil && len(got) > 0 {
-			ids = got
-		}
-	}
-	if len(ids) == 0 {
-		t.clientErr = fmt.Errorf("client mode: --url must contain base64 room list")
-		return t
-	}
-	t.urls = make([]string, 0, len(ids))
-	for _, id := range ids {
-		t.urls = append(t.urls, roomBaseURL+"?room="+id)
-	}
-	utils.Debugf("[CUPS] client mode: %d rooms from base64", len(t.urls))
-	return t
+	return slots
 }
 
-func (t *CupsonlineTransport) Start() error {
-	if t.clientErr != nil {
-		return t.clientErr
-	}
-	if err := t.BaseTransport.Start(); err != nil {
-		return err
-	}
-
-	var auths []*cupsAuth
-	var err error
-
-	if t.isClient {
-		for i, u := range t.urls {
-			a, e := authorizeWithJar(u, t.jar())
-			if e != nil {
-				utils.Debugf("[CUPS] join %d failed: %v", i, e)
-				continue
-			}
-			auths = append(auths, a)
-		}
-		if len(auths) == 0 {
-			return fmt.Errorf("no rooms joined")
-		}
-		t.setRoomList(auths)
-	} else {
-		auths, err = createRooms(t.baseURL, t.config.NumRooms, t.config.RoomCreatePause)
-		if err != nil {
-			return fmt.Errorf("create rooms: %w", err)
-		}
-		t.setRoomList(auths)
-		packed := packRooms(auths)
-		fmt.Printf("\n=== COPY THIS TO CLIENT ===\n")
-		fmt.Printf("%s\n", packed)
-		fmt.Printf("===========================\n\n")
-	}
-
-	t.auths = auths
-
-	side := "X"
-	peerSide := "Y"
-	if t.isClient {
-		side = "Y"
-		peerSide = "X"
-	}
-	for i, a := range auths {
-		cs := &channelStats{idx: i, roomUUID: a.roomUUID}
-		ws := &cupsWS{
-			auth:        a,
-			config:      t.config,
-			ctx:         make(chan struct{}),
-			sendQueue:   make(chan []byte, t.config.SendQueueSize),
-			stats:       cs,
-			side:        side,
-			peerSide:    peerSide,
-			roomIdx:     i,
-			codeVersion: -1,
-			pending:     make(map[int64]chan rpcResp),
-		}
-		ws.onData = t.handleIncoming
-		t.wss = append(t.wss, ws)
-		go ws.run()
-		go ws.sendLoop()
-	}
-
-	utils.Debugf("[CUPS] transport started: %d channels", len(t.wss))
-	t.SetConnected(true)
-
-	go t.statsLoop()
-	return nil
-}
-
+// Stop can come at any time, even before Start is done, and more than once.
 func (t *CupsonlineTransport) Stop() error {
-	select {
-	case <-t.stopCh:
-	default:
-		close(t.stopCh)
-	}
-	for _, ws := range t.wss {
-		ws.closed.Store(true)
-		close(ws.ctx)
-	}
+	t.cancel()
 	t.SetConnected(false)
+	if st := t.stripe.Load(); st != nil {
+		_ = st.Stop()
+	}
 	return t.BaseTransport.Stop()
 }
 
-// Send — flow-hash: один TCP-flow всегда в один WS-канал.
-// Это гарантирует порядок внутри потока, Centrifugo сохраняет порядок push'ей.
+// Send spreads frames across all the connected rooms, round-robin, so the
+// four channels carry the load together instead of one. It can't keep a flow
+// in one room - what arrives here is already a codec frame mixing many flows,
+// with no IP header to hash - so frames from different rooms can arrive out of
+// order; a whole frame always stays within one room (reassembly is per-room),
+// and TCP above puts the rest back in order. A frame is never split across
+// rooms.
 func (t *CupsonlineTransport) Send(data []byte) error {
-	if len(t.wss) == 0 {
-		return fmt.Errorf("no ws")
+	if len(data) > t.config.MaxPayloadBytes {
+		return fmt.Errorf("cups: посылка %d байт больше предела %d", len(data), t.config.MaxPayloadBytes)
 	}
-	key := extractFlowKey(data)
-
-	t.flowMu.RLock()
-	fs, ok := t.flows[key]
-	t.flowMu.RUnlock()
-
-	if !ok {
-		t.flowMu.Lock()
-		fs, ok = t.flows[key]
-		if !ok {
-			idx := int(flowHash(key) % uint64(len(t.wss)))
-			fs = &flowSender{chIdx: idx}
-			t.flows[key] = fs
-			t.wss[idx].stats.flows.Add(1)
-			utils.Debugf("[CUPS] new flow %s:%d -> %s:%d proto=%d -> ws[%d] %s",
-				ipStr(key.srcIP), key.srcPort, ipStr(key.dstIP), key.dstPort, key.proto,
-				idx, t.wss[idx].auth.roomUUID[:8])
-		}
-		t.flowMu.Unlock()
+	if st := t.stripe.Load(); st != nil {
+		return st.Send(data)
 	}
-
-	fs.seq.Add(1)
-	return t.wss[fs.chIdx].Send(data)
+	ws := t.pickRoom()
+	if ws == nil {
+		return errNoRoom
+	}
+	return ws.Send(data)
 }
 
-func (t *CupsonlineTransport) handleIncoming(pkt []byte) {
-	t.CallReceive(pkt)
+// pickRoom returns the next connected room in round-robin order, or nil when
+// none is up.
+func (t *CupsonlineTransport) pickRoom() *cupsWS {
+	n := len(t.wss)
+	if n == 0 {
+		return nil
+	}
+	start := int(t.rr.Add(1))
+	for i := 0; i < n; i++ {
+		ws := t.wss[(start+i)%n]
+		if ws.connected.Load() {
+			return ws
+		}
+	}
+	return nil
 }
 
 func (t *CupsonlineTransport) Receive(callback func([]byte)) {
 	t.BaseTransport.Receive(callback)
 }
 
+// IsConnected is true while at least one room's channel is up, so the app
+// stops claiming "connected" once every room has gone away.
 func (t *CupsonlineTransport) IsConnected() bool {
-	return t.BaseTransport.IsConnected()
+	if !t.BaseTransport.IsConnected() {
+		return false
+	}
+	for _, ws := range t.wss {
+		if ws.connected.Load() {
+			return true
+		}
+	}
+	return false
+}
+
+// reportRooms logs how many rooms are still alive whenever one of them
+// closes or comes back.
+func (t *CupsonlineTransport) reportRooms() {
+	alive := 0
+	for _, ws := range t.wss {
+		if !ws.dead.Load() {
+			alive++
+		}
+	}
+	utils.Infof("[CUPS] Cups: живых комнат %d/%d", alive, len(t.wss))
+	if alive == 0 {
+		utils.Infof("[ERROR] Cups: все комнаты недоступны - пересоздайте комнаты на ноде (запуск без --url) и обновите строку в профиле")
+	}
 }
 
 func (t *CupsonlineTransport) Stats() transport.TransportStats {
@@ -2255,7 +1736,7 @@ func (t *CupsonlineTransport) statsLoop() {
 
 	for {
 		select {
-		case <-t.stopCh:
+		case <-t.ctx.Done():
 			return
 		case <-tick.C:
 			var totalSent, totalRecv, totalBytesSent, totalBytesRecv uint64
@@ -2280,13 +1761,13 @@ func (t *CupsonlineTransport) statsLoop() {
 				totalBytesSent += bs
 				totalBytesRecv += br
 
-				utils.Debugf("[CH-%02d %s] tx=%d pkt/s (%.1f KB/s)  rx=%d pkt/s (%.1f KB/s)  flows=%d  reconn=%d  conn=%v",
-					i, ws.auth.roomUUID[:8],
+				utils.Debugf("[CH-%02d %s] tx=%d pkt/s (%.1f KB/s)  rx=%d pkt/s (%.1f KB/s)  drop=%d  reconn=%d  conn=%v",
+					i, shortRoom(ws.roomUUID),
 					dS/uint64(t.config.StatsInterval.Seconds()),
 					float64(dBS)/t.config.StatsInterval.Seconds()/1024,
 					dR/uint64(t.config.StatsInterval.Seconds()),
 					float64(dBR)/t.config.StatsInterval.Seconds()/1024,
-					ws.stats.flows.Load(),
+					ws.stats.dropped.Load(),
 					ws.stats.reconnects.Load(),
 					ws.connected.Load(),
 				)
@@ -2300,12 +1781,11 @@ func (t *CupsonlineTransport) statsLoop() {
 			lastTotalBytesSent = totalBytesSent
 			lastTotalBytesRecv = totalBytesRecv
 
-			utils.Debugf("[CUPS-TOTAL] tx=%d pkt/s (%.1f KB/s)  rx=%d pkt/s (%.1f KB/s)  flows=%d  uptime=%v",
+			utils.Debugf("[CUPS-TOTAL] tx=%d pkt/s (%.1f KB/s)  rx=%d pkt/s (%.1f KB/s)  uptime=%v",
 				dtS/uint64(t.config.StatsInterval.Seconds()),
 				float64(dtBS)/t.config.StatsInterval.Seconds()/1024,
 				dtR/uint64(t.config.StatsInterval.Seconds()),
 				float64(dtBR)/t.config.StatsInterval.Seconds()/1024,
-				len(t.flows),
 				time.Since(t.statsStart).Round(time.Second),
 			)
 		}
@@ -2313,54 +1793,14 @@ func (t *CupsonlineTransport) statsLoop() {
 }
 
 func (t *CupsonlineTransport) RoomUUIDs() []string {
-	out := make([]string, 0, len(t.auths))
-	for _, a := range t.auths {
-		out = append(out, a.roomUUID)
+	out := make([]string, 0, len(t.wss))
+	for _, ws := range t.wss {
+		out = append(out, ws.roomUUID)
 	}
 	return out
 }
 
 // ---- helpers ----
-
-func extractFlowKey(pkt []byte) flowKey {
-	if len(pkt) < 20 {
-		return flowKey{}
-	}
-	if pkt[0]>>4 != 4 {
-		return flowKey{}
-	}
-	proto := pkt[9]
-	srcIP := binary.BigEndian.Uint32(pkt[12:16])
-	dstIP := binary.BigEndian.Uint32(pkt[16:20])
-	ihl := int(pkt[0]&0x0f) * 4
-	if len(pkt) < ihl+4 {
-		return flowKey{srcIP: srcIP, dstIP: dstIP, proto: proto}
-	}
-	if proto == 6 || proto == 17 {
-		sp := binary.BigEndian.Uint16(pkt[ihl : ihl+2])
-		dp := binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4])
-		return flowKey{srcIP: srcIP, dstIP: dstIP, srcPort: sp, dstPort: dp, proto: proto}
-	}
-	return flowKey{srcIP: srcIP, dstIP: dstIP, proto: proto}
-}
-
-// flowHash — детерминированный хеш от flow. Один поток всегда на один WS.
-func flowHash(k flowKey) uint64 {
-	h := fnv.New64a()
-	var b [14]byte
-	binary.BigEndian.PutUint32(b[0:4], k.srcIP)
-	binary.BigEndian.PutUint32(b[4:8], k.dstIP)
-	binary.BigEndian.PutUint16(b[8:10], k.srcPort)
-	binary.BigEndian.PutUint16(b[10:12], k.dstPort)
-	b[12] = k.proto
-	b[13] = 0
-	h.Write(b[:])
-	return h.Sum64()
-}
-
-func ipStr(ip uint32) string {
-	return fmt.Sprintf("%d.%d.%d.%d", byte(ip>>24), byte(ip>>16), byte(ip>>8), byte(ip))
-}
 
 func firstMatch(re *regexp.Regexp, s string) string {
 	m := re.FindStringSubmatch(s)
@@ -2386,58 +1826,44 @@ func mustParseURL(rawURL string) *url.URL {
 	return u
 }
 
-// jar returns the transport's shared cookie jar (never nil).
-func (t *CupsonlineTransport) jar() *cookiejar.Jar {
-	t.jarMu.RLock()
-	jar := t.cookieJar
-	t.jarMu.RUnlock()
-	if jar == nil {
-		jar, _ = cookiejar.New(nil)
-		t.jarMu.Lock()
-		t.cookieJar = jar
-		t.jarMu.Unlock()
-	}
-	return jar
-}
-
 // ---- CookieExchanger ----
 
-// FetchCookies returns a snapshot of the transport's current cookie jar as
-// name -> value.
+// FetchCookies returns the cookies of the first room that has been entered,
+// as name -> value. Every room keeps its own session (see cupsWS.session),
+// so re-joining doesn't add a new participant; they all live on one site.
 func (t *CupsonlineTransport) FetchCookies() (map[string]string, error) {
-	u, err := url.Parse(roomBaseURL)
+	u, err := url.Parse(baseRoomURL)
 	if err != nil {
 		return nil, err
 	}
 	out := make(map[string]string)
-	for _, c := range t.jar().Cookies(u) {
-		out[c.Name] = c.Value
+	for _, ws := range t.wss {
+		if a := ws.auth(); a != nil {
+			for _, c := range a.httpClient.Jar.Cookies(u) {
+				out[c.Name] = c.Value
+			}
+			break
+		}
 	}
 	return out, nil
 }
 
-// ApplyCookies replaces the transport's cookie jar with the provided values
-// and forces active sessions to reconnect.
+// ApplyCookies puts the provided values into every room's session and drops
+// the connections, so they come back carrying them.
 func (t *CupsonlineTransport) ApplyCookies(values map[string]string) error {
 	if len(values) == 0 {
 		return nil
 	}
-	u, _ := url.Parse(roomBaseURL)
-	jar, _ := cookiejar.New(nil)
+	u, _ := url.Parse(baseRoomURL)
 	cookies := make([]*http.Cookie, 0, len(values))
 	for k, v := range values {
 		cookies = append(cookies, &http.Cookie{Name: k, Value: v, Path: "/"})
 	}
-	jar.SetCookies(u, cookies)
-
-	t.jarMu.Lock()
-	t.cookieJar = jar
-	t.jarMu.Unlock()
-
 	utils.Debugf("[CUPS] applied %d cookies, forcing reconnects", len(cookies))
-
-	// Close all WS sessions; they will reconnect with fresh cookies.
 	for _, ws := range t.wss {
+		if a := ws.auth(); a != nil {
+			a.httpClient.Jar.SetCookies(u, cookies)
+		}
 		if conn := ws.currentConn(); conn != nil {
 			_ = conn.Close()
 		}
