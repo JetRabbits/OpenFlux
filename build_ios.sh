@@ -3,6 +3,10 @@ set -e
 
 OUTPUT_DIR="output/ios"
 LIBRARY_NAME="liboflux"
+# Paths are this checkout's, whatever the caller's directory: an app that
+# links the core as a submodule runs core/build_ios.sh from its own root.
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+OUT="$ROOT/$OUTPUT_DIR/$LIBRARY_NAME.a"
 
 # Paths configuration
 XCODE_PATH="${XCODE_PATH:-$(xcode-select -p 2>/dev/null | sed 's#/Contents/Developer##')}"
@@ -13,7 +17,7 @@ DEVELOPER_DIR="$XCODE_PATH/Contents/Developer"
 SDK_PATH="$DEVELOPER_DIR/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk"
 CLANG="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
 
-mkdir -p "$OUTPUT_DIR"
+mkdir -p "$ROOT/$OUTPUT_DIR"
 
 # Verify paths
 if [ ! -d "$SDK_PATH" ]; then
@@ -39,18 +43,19 @@ export CGO_LDFLAGS="-isysroot $SDK_PATH -arch arm64 -miphoneos-version-min=13.0"
 echo "Building for iOS (arm64)..."
 
 # Build static library
+# Fork: the iOS C API is the root package's //export surface (export_ios*.go,
+# bind_mobile.go) — the surface the JetRabbits mobile pipeline links against.
 if go build \
     -buildmode=c-archive \
     -ldflags="-s -w" \
     -trimpath \
-    -o "$OUTPUT_DIR/$LIBRARY_NAME.a" \
+    -o "$OUT" \
     . ; then
     
-    # go build -buildmode=c-archive auto-generates $OUTPUT_DIR/$LIBRARY_NAME.h
-    # next to the .a from the //export comments in bind_mobile.go — no manual
-    # header stub needed.
-    echo "Build complete: $OUTPUT_DIR/$LIBRARY_NAME.a"
-    ls -lh "$OUTPUT_DIR/$LIBRARY_NAME.a"
+    # go build -buildmode=c-archive auto-generates $OUT.h next to the .a
+    # from the //export comments in bind_mobile.go — no manual header stub.
+    echo "Build complete: $OUT"
+    ls -lh "$OUT"
     
 else
     echo "Build failed"
